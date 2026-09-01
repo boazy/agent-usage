@@ -51,21 +51,6 @@ const BUILTIN_THEMES: &[Theme] = &[
         name: "default",
     },
     Theme {
-    /// Disable progress bars (for logs/CI).
-    #[arg(long)]
-    no_progress: bool,
-}
-        bar_ok: "green",
-        bar_warning: "yellow",
-        bar_exhausted: "red",
-        bar_unknown: "blue",
-        bar_empty: "bright_black",
-        meter_color: "\x1b[38;5;39m",
-        window_color: "\x1b[38;5;243m",
-        reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
-    },
-    Theme {
         name: "solarized-dark",
         bar_ok: "bright_cyan",
         bar_warning: "bright_yellow",
@@ -232,12 +217,9 @@ const BUILTIN_THEMES: &[Theme] = &[
         window_color: "\x1b[38;5;103m",
         reset_color: "\x1b[38;5;243m",
         error_color: "\x1b[31m",
-fn config_file_path() -> Option<PathBuf> {
-    AppDirs::new(Some("codex-usage"), true).map(|app_dirs| app_dirs.config_dir.join("config.toml"))
-}
-    })
-    })
-}
+    },
+    Theme {
+        name: "tokyo-night",
         bar_ok: "bright_blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
@@ -249,10 +231,9 @@ fn config_file_path() -> Option<PathBuf> {
         error_color: "\x1b[31m",
     },
 ];
-const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
 fn config_file_path() -> Option<PathBuf> {
-    let app_dirs = AppDirs::new("codex-usage", true);
-    app_dirs.config_dir().map(|path| path.join("config.toml"))
+    AppDirs::new(Some("codex-usage"), true).map(|app_dirs| app_dirs.config_dir.join("config.toml"))
 }
 
 fn available_theme_names() -> String {
@@ -288,8 +269,7 @@ fn resolve_theme_name(cli: &Cli) -> AppResult<String> {
     builder = builder.add_source(Environment::with_prefix("CODEX_USAGE"));
 
     let cfg = builder.build().map_err(|e| e.to_string())?;
-    cfg.get_string("theme")
-        .map_err(|e| e.to_string())
+    cfg.get_string("theme").map_err(|e| e.to_string())
 }
 
 fn resolve_theme(cli: &Cli) -> AppResult<Theme> {
@@ -330,17 +310,32 @@ struct Cli {
     #[arg(long)]
     no_progress: bool,
 }
-
-    /// Disable progress bars (for logs/CI).
-    #[arg(long)]
-    no_progress: bool,
-}
-
 #[derive(Clone)]
 struct AuthRecord {
     access_token: String,
+    id_token: Option<String>,
+    refresh_token: Option<String>,
     account_id: Option<String>,
-#[derive(Clone)]
+    email: Option<String>,
+    oauth_client_id: Option<String>,
+}
+
+impl AuthRecord {
+    fn needs_persisted_refresh(&self, prior: &AuthRecord) -> bool {
+        self.access_token != prior.access_token
+            || self.id_token != prior.id_token
+            || self.refresh_token != prior.refresh_token
+            || self.account_id != prior.account_id
+            || self.email != prior.email
+    }
+
+    fn default_oauth_client_id(&self) -> &str {
+        self.oauth_client_id
+            .as_deref()
+            .unwrap_or("app_EMoamEEZ73f0CkXaXp7hrann")
+    }
+}
+
 #[derive(Clone)]
 struct UsageWindow {
     used_percent: Option<f64>,
@@ -385,67 +380,20 @@ fn run(cli: Cli) -> AppResult<()> {
     print_usage_report(&usage, &auth, &theme, !cli.no_progress);
     Ok(())
 }
-    access_token: String,
-    id_token: Option<String>,
-    refresh_token: Option<String>,
-    account_id: Option<String>,
-    email: Option<String>,
-    oauth_client_id: Option<String>,
-}
-
-impl AuthRecord {
-    fn needs_persisted_refresh(&self, prior: &AuthRecord) -> bool {
-        self.access_token != prior.access_token
-            || self.id_token != prior.id_token
-            || self.refresh_token != prior.refresh_token
-            || self.account_id != prior.account_id
-fn run(cli: Cli) -> AppResult<()> {
-    let theme = resolve_theme(&cli)?;
-    let auth_path = expand_path(&cli.auth_file);
-    let mut auth = load_auth(&auth_path)?;
-    let original = auth.clone();
-
-    let usage_result = fetch_usage(&cli, &mut auth, !cli.no_progress);
-    if auth.needs_persisted_refresh(&original) {
-        persist_auth(&auth_path, &auth)?;
-    }
-
-    let usage = usage_result?;
-    if cli.json {
-        let pretty = serde_json::to_string_pretty(&usage.raw).map_err(|e| e.to_string())?;
-        println!("{pretty}");
-        return Ok(());
-    }
-
-    print_usage_report(&usage, &auth, &theme, !cli.no_progress);
-    Ok(())
-}
-}
-    limit_reached: Option<bool>,
-    primary_window: Option<UsageWindow>,
-    secondary_window: Option<UsageWindow>,
-}
 
 #[derive(Clone)]
-struct AdditionalRateLimit {
-    limit_name: Option<String>,
-    metered_feature: Option<String>,
+struct ParsedUsage {
+    plan_type: Option<String>,
     rate_limit: Option<RateLimit>,
+    additional_rate_limits: Vec<AdditionalRateLimit>,
+    reset_credits_available: Option<u64>,
+    raw: Value,
 }
 
-#[derive(Clone)]
 #[derive(Clone)]
 struct UsageItem {
     meter: String,
     window_label: String,
-    used_percent: Option<f64>,
-    status: UsageStatus,
-    reset_text: Option<String>,
-}
-
-#[derive(Clone)]
-struct UsageItem {
-    label: String,
     used_percent: Option<f64>,
     status: UsageStatus,
     reset_text: Option<String>,
@@ -467,29 +415,6 @@ fn main() {
     }
 }
 
-fn run(cli: Cli) -> AppResult<()> {
-    let auth_path = expand_path(&cli.auth_file);
-    let auth = load_auth(&auth_path)?;
-    let usage = fetch_usage(&cli, &auth, !cli.no_progress)?;
-fn run(cli: Cli) -> AppResult<()> {
-    let auth_path = expand_path(&cli.auth_file);
-    let mut auth = load_auth(&auth_path)?;
-    let usage_result = fetch_usage(&cli, &mut auth, !cli.no_progress);
-    if auth.needs_persisted_refresh(&original) {
-        persist_auth(&auth_path, &auth)?;
-    }
-
-    let usage = usage_result?;
-    }
-
-    if cli.json {
-        let pretty = serde_json::to_string_pretty(&usage.raw).map_err(|e| e.to_string())?;
-        println!("{pretty}");
-        return Ok(());
-    }
-
-    print_usage_report(&usage, &auth, !cli.no_progress);
-    Ok(())
 fn load_auth(path: &Path) -> AppResult<AuthRecord> {
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let payload: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
@@ -556,8 +481,6 @@ fn normalize_base_url(input: &str) -> String {
     }
     DEFAULT_BASE_URL.to_string()
 }
-    })
-}
 
 fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResult<ParsedUsage> {
     let base = normalize_base_url(&cli.base_url);
@@ -580,9 +503,9 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
         Some(pb)
     } else {
         None
-    let request = |auth: &AuthRecord| -> AppResult<reqwest::blocking::Response> {
+    };
 
-    let mut request = |auth: &AuthRecord| -> AppResult<reqwest::blocking::Response> {
+    let request = |auth: &AuthRecord| -> AppResult<reqwest::blocking::Response> {
         let mut headers = HeaderMap::new();
         let bearer = format!("Bearer {}", auth.access_token);
         headers.insert(
@@ -664,6 +587,13 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
     if let Some(pb) = &spinner {
         pb.finish_and_clear();
     }
+    Err(format!(
+        "usage endpoint returned HTTP {}: {}",
+        first_status,
+        trim_body(&first_body)
+    ))
+}
+
 struct TempAuthFile {
     path: PathBuf,
     remove_on_drop: bool,
@@ -729,10 +659,9 @@ fn create_private_temp_file(path: &Path) -> std::io::Result<fs::File> {
 
     Ok(file)
 }
-}
 
+fn sync_directory_for(path: &Path) -> AppResult<()> {
     let dir = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut dir = fs::File::open(path).map_err(|e| e.to_string())?;
     dir.sync_all().map_err(|e| e.to_string())
 }
 
@@ -802,8 +731,12 @@ fn persist_auth(path: &Path, auth: &AuthRecord) -> AppResult<()> {
         .take()
         .expect("temporary path guard must exist if temp file exists");
 
-    file.write_all(formatted.as_bytes())
-        .map_err(|e| format!("failed writing temporary auth file {}: {e}", guard.path().display()))?;
+    file.write_all(formatted.as_bytes()).map_err(|e| {
+        format!(
+            "failed writing temporary auth file {}: {e}",
+            guard.path().display()
+        )
+    })?;
     file.flush().map_err(|e| {
         format!(
             "failed flushing temporary auth file {}: {e}",
@@ -831,22 +764,6 @@ fn persist_auth(path: &Path, auth: &AuthRecord) -> AppResult<()> {
     guard.commit();
     sync_directory_for(directory)
 }
-fn refresh_access_token(auth: &mut AuthRecord) -> AppResult<()> {
-    let refresh_token = auth
-        .refresh_token
-        .as_deref()
-        .ok_or_else(|| "auth file missing tokens.refresh_token".to_string())?;
-    }
-    if let Some(account_id) = auth.account_id.as_ref() {
-        tokens.insert("account_id".to_string(), Value::String(account_id.clone()));
-    } else {
-        tokens.remove("account_id");
-    }
-
-    let formatted = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
-    fs::write(path, formatted).map_err(|e| e.to_string())?;
-    Ok(())
-}
 
 fn refresh_access_token(auth: &mut AuthRecord) -> AppResult<()> {
     let refresh_token = auth
@@ -865,8 +782,90 @@ fn refresh_access_token(auth: &mut AuthRecord) -> AppResult<()> {
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", auth.default_oauth_client_id()),
+        ])
+        .send()
+        .map_err(|e| format!("refresh request failed: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .unwrap_or_else(|_| "unable to read response body".to_string());
+    if !status.is_success() {
+        return Err(format!(
+            "refresh request returned HTTP {}: {}",
+            status,
+            trim_body(&body)
+        ));
+    }
+
+    let token_payload: Value = serde_json::from_str(&body).map_err(|e| {
+        format!(
+            "failed to parse refresh response JSON: {}: {}",
+            e,
+            trim_body(&body)
+        )
+    })?;
+
+    let refreshed_access_token = token_payload
+        .get("access_token")
+        .and_then(as_string)
+        .ok_or_else(|| "refresh response missing access_token".to_string())?;
+
+    let refreshed_id_token = token_payload.get("id_token").and_then(as_string);
+    let refreshed_refresh_token = token_payload.get("refresh_token").and_then(as_string);
+    auth.access_token = refreshed_access_token;
+    if refreshed_id_token.is_some() {
+        auth.id_token = refreshed_id_token;
+    }
+    if refreshed_refresh_token.is_some() {
+        auth.refresh_token = refreshed_refresh_token;
+    }
+
+    if let Some(id_token) = auth.id_token.as_deref() {
+        auth.oauth_client_id = parse_jwt_aud(id_token).or_else(|| auth.oauth_client_id.clone());
+        auth.account_id = parse_jwt_claim(id_token, JWT_AUTH_CLAIM, "chatgpt_account_id")
+            .or_else(|| parse_jwt_claim(&auth.access_token, JWT_AUTH_CLAIM, "chatgpt_account_id"))
+            .or_else(|| auth.account_id.clone());
+        if let Some(email) = parse_jwt_claim(id_token, JWT_PROFILE_CLAIM, "email") {
+            auth.email = Some(email);
+        }
+    } else if let Some(parsed) = parse_jwt_claim(&auth.access_token, JWT_PROFILE_CLAIM, "email") {
+        auth.email = Some(parsed);
+    }
+
+    Ok(())
+}
+
+fn trim_body(body: &str) -> String {
+    const LIMIT: usize = 1_000;
+    if body.len() > LIMIT {
+        let mut trimmed = body.chars().take(LIMIT).collect::<String>();
+        trimmed.push_str("…");
+        trimmed
+    } else {
+        body.to_string()
+    }
+}
+
+fn parse_jwt_aud(token: &str) -> Option<String> {
+    let claims = parse_jwt(token)?;
+    if let Some(aud) = claims.get("aud") {
+        if let Some(value) = aud.as_str() {
+            return Some(value.to_string());
+        }
+
+        if let Some(values) = aud.as_array() {
+            for value in values {
+                if let Some(value) = value.as_str() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, PartialEq, Eq)]
-struct BankReset {
 struct BankReset {
     source: String,
     expires_in: String,
@@ -877,6 +876,7 @@ fn print_usage_report(usage: &ParsedUsage, auth: &AuthRecord, theme: &Theme, use
     println!("{}", colorize(theme.meter_color, "================"));
 
     println!("{}", format_account_plan_line(auth, usage, theme));
+
     if let Some(credits) = usage.reset_credits_available {
         println!(
             "{} {}",
@@ -884,8 +884,8 @@ fn print_usage_report(usage: &ParsedUsage, auth: &AuthRecord, theme: &Theme, use
             colorize(theme.meter_color, &credits.to_string())
         );
     }
-    }
     println!();
+
     let now_ms = now_millis();
     let mut items = collect_items(usage, now_ms);
     if items.is_empty() {
@@ -967,11 +967,7 @@ fn collect_banked_resets(payload: &ParsedUsage, now_ms: u64) -> Vec<BankReset> {
     resets
 }
 
-fn push_banked_reset(
-    resets: &mut Vec<BankReset>,
-    source: String,
-    expiration: Option<String>,
-) {
+fn push_banked_reset(resets: &mut Vec<BankReset>, source: String, expiration: Option<String>) {
     let Some(expires_in) = expiration else {
         return;
     };
@@ -1095,167 +1091,6 @@ fn build_usage_item(
         reset_text: resolve_reset_text(window, now_ms),
     }
 }
-    }
-}
-
-fn collect_items(payload: &ParsedUsage, now_ms: u64) -> Vec<UsageItem> {
-    let mut items = Vec::new();
-
-    if let Some(rate_limit) = &payload.rate_limit {
-        if let Some(window) = &rate_limit.primary_window {
-            items.push(build_usage_item(
-                "Codex",
-                window,
-                rate_limit.allowed,
-                rate_limit.limit_reached,
-                now_ms,
-            ));
-        }
-        if let Some(window) = &rate_limit.secondary_window {
-            items.push(build_usage_item(
-                "Codex",
-                window,
-                rate_limit.allowed,
-                rate_limit.limit_reached,
-                now_ms,
-            ));
-        }
-    }
-
-    for extra in &payload.additional_rate_limits {
-        let slug = additional_limit_slug(
-            extra.limit_name.as_deref(),
-            extra.metered_feature.as_deref(),
-        );
-        let display_name = match slug.as_str() {
-            "spark" => "Spark".to_string(),
-            "chat" => "Codex".to_string(),
-            _ => extra
-                .limit_name
-                .as_ref()
-                .map(|name| normalize_usage_label(name))
-                .unwrap_or_else(|| title_case_slug(&slug)),
-        };
-
-        if let Some(rate_limit) = &extra.rate_limit {
-            if let Some(window) = &rate_limit.primary_window {
-                items.push(build_usage_item(
-                    &display_name,
-                    window,
-                    rate_limit.allowed,
-                    rate_limit.limit_reached,
-                    now_ms,
-                ));
-            }
-            if let Some(window) = &rate_limit.secondary_window {
-            if use_progress {
-                render_usage_bar(
-                    &prefix,
-                    &line,
-                    bar_fill,
-                    bar_empty,
-                    filled,
-                );
-            } else {
-                println!("{:<22} {}", prefix, line);
-            }
-        }
-        None => {
-            let mut line = String::from("[unknown usage percentage]");
-            if let Some(reset_text) = &item.reset_text {
-                line.push(' ');
-                line.push_str(&colorize(theme.reset_color, reset_text));
-            }
-            if let Some(status) = status_label {
-                line.push(' ');
-                line.push_str(&colorize(theme.error_color, status));
-            }
-            if use_progress {
-                println!("{: <22} {}", prefix, line);
-            } else {
-fn render_usage_bar(prefix: &str, line: &str, bar_fill: &str, bar_empty: &str, filled: u64) {
-    let bar = ProgressBar::new(100);
-    render_usage_bar_with_width(
-        &bar,
-        .progress_chars("█▓▒░ ");
-        prefix,
-        line,
-        bar_fill,
-        bar_empty,
-        filled,
-    );
-}
-
-fn render_usage_bar_with_width(
-    bar: &ProgressBar,
-    width: usize,
-    prefix: &str,
-    line: &str,
-    bar_fill: &str,
-    bar_empty: &str,
-    filled: u64,
-) {
-    let template = format!(
-        "{{prefix:<19}} {{bar:{width}.{bar_fill}/{bar_empty}}} {{msg}}",
-        width = width,
-        bar_fill = bar_fill,
-        bar_empty = bar_empty
-    );
-    let bar_style = ProgressStyle::with_template(&template)
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("█▉▊▌ ");
-    bar.set_style(bar_style);
-    bar.set_prefix(prefix.to_string());
-    bar.set_message(line.to_string());
-    bar.set_position(filled);
-    bar.abandon();
-}
-    bar.set_style(bar_style);
-    bar.set_prefix(prefix.to_string());
-    bar.set_message(line.to_string());
-    bar.set_position(filled);
-    bar.abandon();
-}
-
-fn normalize_usage_label(name: &str) -> String {
-    let normalized = name.trim().to_lowercase();
-    if normalized == "chat" {
-        return "Codex".to_string();
-    }
-    if normalized == "spark" {
-        return "Spark".to_string();
-    }
-    title_case_slug(&slugify(&normalized))
-}
-
-fn fit_width(value: &str, width: usize) -> String {
-    let truncated: String = value.chars().take(width).collect();
-    let pad = width.saturating_sub(truncated.chars().count());
-    if pad == 0 {
-        truncated
-    } else {
-        format!("{truncated}{}", " ".repeat(pad))
-    }
-}
-
-fn colorize(ansi: &str, text: &str) -> String {
-    format!("{ansi}{text}{ANSI_RESET}")
-}
-
-fn parse_usage_payload(payload: Value) -> ParsedUsage {
-    window: &UsageWindow,
-    allowed: Option<bool>,
-    limit_reached: Option<bool>,
-    now_ms: u64,
-) -> UsageItem {
-    UsageItem {
-        meter: meter.to_string(),
-        window_label: window_label(window.limit_window_seconds),
-        used_percent: window.used_percent,
-        status: usage_status(window.used_percent, allowed, limit_reached),
-        reset_text: resolve_reset_text(window, now_ms),
-    }
-}
 
 fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
     let status_label = match item.status {
@@ -1293,20 +1128,7 @@ fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
             }
 
             if use_progress {
-                let template = format!(
-                    "{{prefix:<19}} {{bar:44.{bar_fill}/{bar_empty}}} {{msg}}",
-                    bar_fill = bar_fill,
-                    bar_empty = bar_empty
-                );
-                let bar_style = ProgressStyle::with_template(&template)
-                    .unwrap_or_else(|_| ProgressStyle::default_bar())
-                    .progress_chars("█▉▊▌ ");
-                let bar = ProgressBar::new(100);
-                bar.set_style(bar_style);
-                bar.set_prefix(prefix);
-                bar.set_message(line);
-                bar.set_position(filled);
-                bar.finish_with_message("");
+                render_usage_bar(&prefix, &line, bar_fill, bar_empty, filled);
             } else {
                 println!("{:<22} {}", prefix, line);
             }
@@ -1328,6 +1150,36 @@ fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
             }
         }
     }
+}
+
+fn render_usage_bar(prefix: &str, line: &str, bar_fill: &str, bar_empty: &str, filled: u64) {
+    let bar = ProgressBar::new(100);
+    render_usage_bar_with_width(&bar, 44, prefix, line, bar_fill, bar_empty, filled);
+}
+
+fn render_usage_bar_with_width(
+    bar: &ProgressBar,
+    width: usize,
+    prefix: &str,
+    line: &str,
+    bar_fill: &str,
+    bar_empty: &str,
+    filled: u64,
+) {
+    let template = format!(
+        "{{prefix:<19}} {{bar:{width}.{bar_fill}/{bar_empty}}} {{msg}}",
+        width = width,
+        bar_fill = bar_fill,
+        bar_empty = bar_empty
+    );
+    let bar_style = ProgressStyle::with_template(&template)
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("█▓▒░ ");
+    bar.set_style(bar_style);
+    bar.set_prefix(prefix.to_string());
+    bar.set_message(line.to_string());
+    bar.set_position(filled);
+    bar.abandon();
 }
 
 fn normalize_usage_label(name: &str) -> String {
@@ -1354,17 +1206,17 @@ fn fit_width(value: &str, width: usize) -> String {
 fn colorize(ansi: &str, text: &str) -> String {
     format!("{ansi}{text}{ANSI_RESET}")
 }
-            let mut message = format!("{:<20} [unknown usage percentage] {}", item.label, status);
-            if let Some(reset_text) = &item.reset_text {
-                message.push_str(" | ");
-                message.push_str(reset_text);
-            }
-            println!("{message}");
-        }
-    }
-}
 
 fn parse_usage_payload(payload: Value) -> ParsedUsage {
+    let raw_obj = payload.as_object().cloned().unwrap_or_default();
+
+    let plan_type = raw_obj.get("plan_type").and_then(as_string);
+
+    let rate_limit = raw_obj
+        .get("rate_limit")
+        .and_then(Value::as_object)
+        .and_then(parse_rate_limit);
+
     let additional_rate_limits = raw_obj
         .get("additional_rate_limits")
         .and_then(Value::as_array)
@@ -1445,29 +1297,48 @@ fn parse_additional_rate_limit(raw: &Value) -> Option<AdditionalRateLimit> {
     let obj = raw.as_object()?;
     let limit_name = obj.get("limit_name").and_then(as_string);
     let metered_feature = obj.get("metered_feature").and_then(as_string);
-    let rate_limit = obj.get("rate_limit").and_then(Value::as_object).and_then(parse_rate_limit);
+    let rate_limit = obj
+        .get("rate_limit")
+        .and_then(Value::as_object)
+        .and_then(parse_rate_limit);
 
     if limit_name.is_none() && metered_feature.is_none() && rate_limit.is_none() {
-    let source = source
-        .strip_prefix("codex_")
-        .or_else(|| source.strip_prefix("codex-"))
-        .unwrap_or(&source)
-        .to_string();
-    let slug = slugify(&source);
-    if slug.is_empty() {
-        "extra".to_string()
-    } else {
-    if slug.is_empty() {
-        "extra".to_string()
-    } else {
-        slug
+        return None;
     }
-}
 
-fn window_label(seconds: Option<u64>) -> String {
+    Some(AdditionalRateLimit {
+        limit_name,
+        metered_feature,
+        rate_limit,
+    })
 }
 
 fn usage_status(
+    used_percent: Option<f64>,
+    explicitly_allowed: Option<bool>,
+    limit_reached: Option<bool>,
+) -> UsageStatus {
+    let used_fraction = used_percent.and_then(|percent| {
+        if !percent.is_finite() {
+            return None;
+        }
+        Some((percent / 100.0).clamp(0.0, 1.0))
+    });
+
+    match used_fraction {
+        None => UsageStatus::Unknown,
+        Some(frac) if frac >= 1.0 => {
+            if explicitly_allowed == Some(true) && limit_reached != Some(true) {
+                UsageStatus::Warning
+            } else {
+                UsageStatus::Exhausted
+            }
+        }
+        Some(frac) if frac >= 0.9 => UsageStatus::Warning,
+        Some(_) => UsageStatus::Ok,
+    }
+}
+
 fn additional_limit_slug(limit_name: Option<&str>, metered_feature: Option<&str>) -> String {
     let probe = format!(
         "{} {}",
@@ -1479,6 +1350,10 @@ fn additional_limit_slug(limit_name: Option<&str>, metered_feature: Option<&str>
         return "spark".to_string();
     }
 
+    let source = metered_feature
+        .or(limit_name)
+        .unwrap_or("extra")
+        .to_lowercase();
     let source = source
         .strip_prefix("codex_")
         .or_else(|| source.strip_prefix("codex-"))
@@ -1489,13 +1364,100 @@ fn additional_limit_slug(limit_name: Option<&str>, metered_feature: Option<&str>
         "extra".to_string()
     } else {
         slug
+    }
+}
+
+fn window_label(seconds: Option<u64>) -> String {
+    if let Some(total_seconds) = seconds {
+        if total_seconds >= 86_400 {
+            let days = (total_seconds as f64 / 86_400.0).round() as u64;
+            format!("{} day{}", days, if days == 1 { "" } else { "s" })
+        } else if total_seconds >= 3_600 {
+            let hours = (total_seconds as f64 / 3_600.0).round() as u64;
+            format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+        } else {
+            let minutes = (total_seconds as f64 / 60.0).round() as u64;
+            format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" })
+        }
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn slugify(input: &str) -> String {
+    let normalized = input.trim().to_lowercase();
+    let no_prefix = normalized
+        .trim_start_matches("codex-")
+        .trim_start_matches("codex_");
+    let mut slug = String::with_capacity(no_prefix.len());
+    let mut last_dash = false;
+    for normalized_ch in no_prefix.chars() {
+        let normalized_ch = normalized_ch.to_ascii_lowercase();
+        if normalized_ch.is_ascii_alphanumeric() {
+            last_dash = false;
+            slug.push(normalized_ch);
+            continue;
+        }
+        if normalized_ch == '-' || normalized_ch == '_' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+            slug.push('-');
+        } else {
+            last_dash = false;
+            slug.push(' ');
+        }
+    }
+
+    slug.trim_matches('-').to_string()
+}
+
+fn title_case_slug(slug: &str) -> String {
+    slug.split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = String::new();
+                    out.push(first.to_ascii_uppercase());
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn resolve_reset_text(window: &UsageWindow, now_ms: u64) -> Option<String> {
+    let reset_ms = resolve_reset_time(window, now_ms)?;
+    let diff_secs = (reset_ms.saturating_sub(now_ms) / 1000).clamp(0, u64::MAX);
+    Some(format!("resets in {}", human_duration(diff_secs)))
+}
+
+fn resolve_reset_time(window: &UsageWindow, now_ms: u64) -> Option<u64> {
+    if let Some(raw_reset_at) = window.reset_at {
+        let ms = if raw_reset_at > 1_000_000_000_000 {
+            raw_reset_at
+        } else {
+            raw_reset_at.saturating_mul(1000)
+        };
+        return Some(ms);
+    }
+    window
+        .reset_after_seconds
+        .map(|after_secs| now_ms.saturating_add(after_secs.saturating_mul(1000)))
+}
+
 fn human_duration(total_seconds: u64) -> String {
-    use super::{
-        additional_limit_slug, collect_banked_resets, format_account_plan_line, human_duration,
-        now_millis, persist_auth, render_usage_bar_with_width, AuthRecord, ParsedUsage,
-        AdditionalRateLimit, BUILTIN_THEMES, RateLimit, UsageWindow,
-    };
-    use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
+    if total_seconds == 0 {
+        return "0s".to_string();
+    }
+
+    let days = total_seconds / 86_400;
     let hours = (total_seconds % 86_400) / 3_600;
     let mins = (total_seconds % 3_600) / 60;
     let secs = total_seconds % 60;
@@ -1503,6 +1465,33 @@ fn human_duration(total_seconds: u64) -> String {
     let mut parts = Vec::new();
     if days > 0 {
         parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if secs > 0 {
+        parts.push(format!("{secs}s"));
+    }
+
+    if parts.is_empty() {
+        return "0s".to_string();
+    }
+
+    let shown_parts = parts.into_iter().take(3).collect::<Vec<_>>();
+    shown_parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        additional_limit_slug, collect_banked_resets, format_account_plan_line, human_duration,
+        now_millis, persist_auth, render_usage_bar_with_width, AdditionalRateLimit, AuthRecord,
+        ParsedUsage, RateLimit, UsageWindow, BUILTIN_THEMES,
+    };
+    use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
     use std::env;
     use std::fmt;
     use std::fs;
@@ -1515,17 +1504,10 @@ fn human_duration(total_seconds: u64) -> String {
     }
 
     impl RecordingTerm {
-#[cfg(test)]
-    use super::{
-        additional_limit_slug,
-        human_duration,
-        now_millis,
-        persist_auth,
-        render_usage_bar_with_width,
-        AuthRecord,
-    };
-    use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
-    use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
+        fn new() -> Self {
+            Self::default()
+        }
+
         fn contents(&self) -> String {
             self.output.lock().unwrap().clone()
         }
@@ -1571,7 +1553,21 @@ fn human_duration(total_seconds: u64) -> String {
 
         fn write_str(&self, s: &str) -> io::Result<()> {
             let mut output = self.output.lock().unwrap();
-    #[test]
+            output.push_str(s);
+            Ok(())
+        }
+
+        fn clear_line(&self) -> io::Result<()> {
+            let mut output = self.output.lock().unwrap();
+            output.push_str("\r\x1b[2K");
+            Ok(())
+        }
+
+        fn flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn progress_bar_abandon_keeps_partial_fill_and_message() {
         let term = RecordingTerm::new();
@@ -1603,8 +1599,6 @@ fn human_duration(total_seconds: u64) -> String {
         assert!(bar_start < msg_start, "bar should render before message");
         let bar_segment = &last_rendered_frame[bar_start..msg_start];
 
-        let filled_cells = bar_segment
-            .chars()
         let filled_cells = bar_segment
             .chars()
             .filter(|c| matches!(c, '█' | '▉' | '▊' | '▌' | '▓' | '▒' | '░'))
@@ -1676,98 +1670,40 @@ fn human_duration(total_seconds: u64) -> String {
 
         let resets = collect_banked_resets(&usage, 0);
         assert_eq!(resets.len(), 2);
+        assert!(resets
+            .iter()
+            .any(|item| item.source == "Codex (1 day)" && item.expires_in == "expires in 1h"));
         assert!(
             resets
                 .iter()
-                .any(|item| item.source == "Codex (1 day)" && item.expires_in == "expires in 1h")
-        );
-        assert!(
-            resets
-                .iter()
-                .any(|item| item.source == "Spark (30 minutes)" && item.expires_in == "expires in 15m")
+                .any(|item| item.source == "Spark (30 minutes)"
+                    && item.expires_in == "expires in 15m")
         );
     }
 
     #[test]
     fn human_duration_keeps_day_hour_minute_for_90060() {
-
-        assert!(filled_cells > 0, "partial bar should include fill chars");
-        assert!(filled_cells < 10, "bar should not be fully filled at 42%");
-        assert!(empty_cells > 0, "partial bar should include unfilled width");
-    }
-        }
-
-        fn flush(&self) -> io::Result<()> {
-            Ok(())
-        }
+        assert_eq!(human_duration(90060), "1d 1h 1m");
     }
 
     #[test]
-    fn progress_bar_abandon_keeps_partial_fill_and_message() {
-        let term = RecordingTerm::new();
-        let bar = ProgressBar::with_draw_target(
-            Some(100),
-            ProgressDrawTarget::term_like(Box::new(term.clone())),
-        );
-        render_usage_bar_with_width(
-    #[test]
-    fn progress_bar_abandon_keeps_partial_fill_and_message() {
-        let term = RecordingTerm::new();
-        let bar = ProgressBar::with_draw_target(
-            Some(100),
-            ProgressDrawTarget::term_like(Box::new(term.clone())),
-        );
-        render_usage_bar_with_width(&bar, 10, "Codex (7 days)", " 42.0%", "green", "black", 42);
-    #[test]
-    fn progress_bar_abandon_keeps_partial_fill_and_message() {
-        let term = RecordingTerm::new();
-        let bar = ProgressBar::with_draw_target(
-            Some(100),
-            ProgressDrawTarget::term_like(Box::new(term.clone())),
-        );
-        render_usage_bar_with_width(
-            &bar,
-            10,
-            "Codex (7 days)",
-            " 42.0%",
-            "green",
-            "black",
-            42,
-        );
-        let output = term.contents();
-        assert!(output.contains("Codex (7 days)"));
-        assert!(output.contains("42.0%"));
-
-        let last_rendered_frame = output
-            .split("\r\x1b[2K")
-            .filter(|frame| !frame.is_empty())
-            .filter(|frame| frame.contains('█'))
-            .last()
-            .expect("progress bar frame should be captured");
-        let bar_start = last_rendered_frame
-            .find('█')
-            .expect("bar should render a filled segment");
-        let msg_start = last_rendered_frame
-            .rfind("42.0%")
-            .expect("message should be rendered with progress bar");
-        assert!(bar_start < msg_start, "bar should render before message");
-        let bar_segment = &last_rendered_frame[bar_start..msg_start];
-
-        let filled_cells = bar_segment
-            .chars()
-            .filter(|c| matches!(c, '█' | '▉' | '▊' | '▌'))
-            .count();
-        let empty_cells = bar_segment
-            .chars()
-            .filter(|c| *c == ' ')
-            .count();
-
-        assert!(filled_cells > 0, "partial bar should include fill chars");
-        assert!(filled_cells < 10, "bar should not be fully filled at 42%");
-        assert!(empty_cells > 0, "partial bar should include unfilled width");
-        assert!(filled_cells < 10, "bar should not be fully filled at 42%");
-        assert!(empty_cells > 0, "partial bar should include unfilled width");
+    fn human_duration_keeps_day_minute_second_for_86461() {
+        assert_eq!(human_duration(86461), "1d 1m 1s");
     }
+
+    #[test]
+    fn human_duration_keeps_zero_minutes_when_necessary() {
+        assert_eq!(human_duration(90000), "1d 1h");
+    }
+
+    #[test]
+    fn additional_limit_slug_removes_codex_prefix_and_defaults_to_extra() {
+        assert_eq!(
+            additional_limit_slug(Some("codex_extra-feature"), None),
+            "extra-feature"
+        );
+        assert_eq!(
+            additional_limit_slug(Some("codex-extra-feature"), None),
             "extra-feature"
         );
         assert_eq!(additional_limit_slug(Some("codex-"), None), "extra");
@@ -1793,53 +1729,6 @@ fn human_duration(total_seconds: u64) -> String {
             &auth_path,
             r#"{"plan_type":"legacy","tokens":{"access_token":"old","id_token":"old_id","refresh_token":"old_ref","account_id":"old_acct","keep":"keep-me"}}"#,
         )
-        .expect("seed auth file");
-
-        let auth = AuthRecord {
-            access_token: "new_access".to_string(),
-            id_token: Some("new_id".to_string()),
-            refresh_token: None,
-            account_id: Some("new_acct".to_string()),
-            email: Some("x@example.com".to_string()),
-            oauth_client_id: Some("id".to_string()),
-        };
-
-        persist_auth(&auth_path, &auth).expect("persist_auth");
-
-        let updated = fs::read_to_string(&auth_path).expect("read updated auth");
-        let updated: serde_json::Value = serde_json::from_str(&updated).expect("parse updated auth");
-
-        assert_eq!(updated["plan_type"], "legacy");
-        let tokens = updated.get("tokens").expect("tokens exists");
-        assert_eq!(tokens["access_token"], "new_access");
-        assert_eq!(tokens["id_token"], "new_id");
-        assert_eq!(tokens["account_id"], "new_acct");
-        assert!(tokens.get("refresh_token").is_none());
-        assert_eq!(tokens["keep"], "keep-me");
-
-        let mut has_temp = false;
-        for entry in fs::read_dir(&base).expect("scan temp dir") {
-            let entry = entry.expect("entry");
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".codex-auth-") && name.ends_with(".tmp") {
-                has_temp = true;
-                break;
-            }
-        }
-        assert!(!has_temp);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&auth_path).expect("metadata").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-
-        fs::remove_dir_all(base).expect("remove temp dir");
-    }
-}
-
-fn parse_jwt_claim(token: &str, top: &str, inner: &str) -> Option<String> {
         .expect("seed auth file");
 
         let auth = AuthRecord {
@@ -1891,344 +1780,26 @@ fn parse_jwt_claim(token: &str, top: &str, inner: &str) -> Option<String> {
 }
 
 fn parse_jwt_claim(token: &str, top: &str, inner: &str) -> Option<String> {
-            slug.push(' ');
-        }
-    }
-
-    slug.trim_matches('-').to_string()
-}
-                if minutes == 1 { "" } else { "s" }
-            )
-        }
-    } else {
-        "unknown".to_string()
-    }
-}
-        return "spark".to_string();
-    }
-
-    let source = metered_feature
-        .or(limit_name)
-        .unwrap_or("extra")
-        .to_lowercase();
-    let slug = slugify(&source);
-    if slug.is_empty() { "extra".to_string() } else { slug }
+    let claims = parse_jwt(token)?;
+    claims
+        .get(top)
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(inner))
+        .and_then(as_string)
 }
 
-fn slugify(input: &str) -> String {
-    let normalized = input.trim().to_lowercase();
-    let no_prefix = normalized
-        .strip_prefix("codex-")
-        .or_else(|| normalized.strip_prefix("codex_"))
-        .unwrap_or(&normalized);
+fn parse_jwt(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _sig = parts.next()?;
 
-    let mut slug = String::new();
-    let mut last_dash = false;
-
-    for ch in no_prefix.chars() {
-        let normalized_ch = match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' => ch.to_ascii_lowercase(),
-            ' ' | '_' | '-' => '-',
-            _ => {
-                continue;
-            }
-        };
-
-        if normalized_ch == '-' {
-            if last_dash {
-                continue;
-            }
-            last_dash = true;
-            slug.push('-');
-        } else {
-            last_dash = false;
-            slug.push(normalized_ch);
-        }
+    let mut payload = payload.to_string();
+    while !payload.len().is_multiple_of(4) {
+        payload.push('=');
     }
-
-    slug.trim_matches('-').to_string()
-}
-}
-    use std::fs;
-    use std::path::Path;
-
-    #[test]
-    fn human_duration_keeps_day_hour_minute_for_90060() {
-        assert_eq!(human_duration(90060), "1d 1h 1m");
-    }
-
-    #[test]
-    fn human_duration_keeps_day_minute_second_for_86461() {
-        assert_eq!(human_duration(86461), "1d 1m 1s");
-    }
-
-    #[test]
-    fn human_duration_keeps_zero_minutes_when_necessary() {
-        assert_eq!(human_duration(90000), "1d 1h");
-    }
-
-    #[test]
-    fn persist_auth_preserves_unrelated_fields_and_replaces_temp_credentials() {
-        let mut base = env::temp_dir();
-        base.push(format!(
-            "codex-usage-auth-test-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&base).expect("create temp dir");
-        let auth_path = base.join("auth.json");
-        fs::write(
-            &auth_path,
-            r#"{"plan_type":"legacy","tokens":{"access_token":"old","id_token":"old_id","refresh_token":"old_ref","account_id":"old_acct","keep":"keep-me"}}"#,
-        )
-        .expect("seed auth file");
-
-        let auth = AuthRecord {
-            access_token: "new_access".to_string(),
-            id_token: Some("new_id".to_string()),
-            refresh_token: None,
-            account_id: Some("new_acct".to_string()),
-            email: Some("x@example.com".to_string()),
-            oauth_client_id: Some("id".to_string()),
-        };
-
-        persist_auth(&auth_path, &auth).expect("persist_auth");
-
-        let updated = fs::read_to_string(&auth_path).expect("read updated auth");
-        let updated: serde_json::Value = serde_json::from_str(&updated).expect("parse updated auth");
-
-        assert_eq!(updated["plan_type"], "legacy");
-        let tokens = updated.get("tokens").expect("tokens exists");
-        assert_eq!(tokens["access_token"], "new_access");
-        assert_eq!(tokens["id_token"], "new_id");
-        assert_eq!(tokens["account_id"], "new_acct");
-        assert!(tokens.get("refresh_token").is_none());
-    let mins = (total_seconds % 3_600) / 60;
-    let secs = total_seconds % 60;
-
-    let mut parts = Vec::new();
-    if days > 0 {
-        parts.push(format!("{days}d"));
-    }
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if mins > 0 {
-        parts.push(format!("{mins}m"));
-    }
-    if secs > 0 {
-        parts.push(format!("{secs}s"));
-    }
-
-    if parts.is_empty() {
-        return "0s".to_string();
-    }
-
-    let shown_parts = parts.into_iter().take(3).collect::<Vec<_>>();
-    shown_parts.join(" ")
-}
-    use std::fs;
-
-    #[test]
-    fn human_duration_keeps_day_hour_minute_for_90060() {
-    use super::{additional_limit_slug, human_duration, now_millis, persist_auth, AuthRecord};
-    use std::env;
-    use std::fs;
-    #[test]
-    fn human_duration_keeps_day_minute_second_for_86461() {
-        assert_eq!(human_duration(86461), "1d 1m 1s");
-    }
-
-    #[test]
-    fn human_duration_keeps_zero_minutes_when_necessary() {
-        assert_eq!(human_duration(90000), "1d 1h");
-    }
-
-    #[test]
-    fn persist_auth_preserves_unrelated_fields_and_replaces_temp_credentials() {
-    fn human_duration_keeps_zero_minutes_when_necessary() {
-        assert_eq!(human_duration(90000), "1d 1h");
-    }
-
-    #[test]
-    fn additional_limit_slug_removes_codex_prefix_and_defaults_to_extra() {
-        assert_eq!(
-            additional_limit_slug(Some("codex_extra-feature"), None),
-            "extra-feature"
-        );
-        assert_eq!(
-            additional_limit_slug(Some("codex-extra-feature"), None),
-            "extra-feature"
-        );
-        assert_eq!(additional_limit_slug(Some("codex-"), None), "extra");
-        assert_eq!(additional_limit_slug(None, None), "extra");
-    }
-
-    #[test]
-    fn additional_limit_slug_prefers_spark() {
-        assert_eq!(additional_limit_slug(Some("codex_spark"), None), "spark");
-    }
-    #[test]
-    fn persist_auth_preserves_unrelated_fields_and_replaces_temp_credentials() {
-        let mut base = env::temp_dir();
-        base.push(format!(
-            "codex-usage-auth-test-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&base).expect("create temp dir");
-        let auth_path = base.join("auth.json");
-        fs::write(
-            &auth_path,
-            r#"{"plan_type":"legacy","tokens":{"access_token":"old","id_token":"old_id","refresh_token":"old_ref","account_id":"old_acct","keep":"keep-me"}}"#,
-        )
-        .expect("seed auth file");
-
-        let auth = AuthRecord {
-            access_token: "new_access".to_string(),
-            id_token: Some("new_id".to_string()),
-            refresh_token: None,
-            account_id: Some("new_acct".to_string()),
-            email: Some("x@example.com".to_string()),
-            oauth_client_id: Some("id".to_string()),
-        };
-        };
-
-        persist_auth(&auth_path, &auth).expect("persist_auth");
-
-        let updated = fs::read_to_string(&auth_path).expect("read updated auth");
-        let updated: serde_json::Value = serde_json::from_str(&updated).expect("parse updated auth");
-
-        assert_eq!(updated["plan_type"], "legacy");
-        let tokens = updated.get("tokens").expect("tokens exists");
-        assert_eq!(tokens["access_token"], "new_access");
-        assert_eq!(tokens["id_token"], "new_id");
-        assert_eq!(tokens["account_id"], "new_acct");
-        assert!(tokens.get("refresh_token").is_none());
-        assert_eq!(tokens["keep"], "keep-me");
-
-        let mut has_temp = false;
-        for entry in fs::read_dir(&base).expect("scan temp dir") {
-            let entry = entry.expect("entry");
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".codex-auth-") && name.ends_with(".tmp") {
-                has_temp = true;
-                break;
-            }
-        }
-        assert!(!has_temp);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&auth_path)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-
-        fs::remove_dir_all(base).expect("remove temp dir");
-    }
-}
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn resolve_reset_text(window: &UsageWindow, now_ms: u64) -> Option<String> {
-    let reset_ms = resolve_reset_time(window, now_ms)?;
-    let diff_secs = (reset_ms.saturating_sub(now_ms) / 1000).clamp(0, u64::MAX);
-    Some(format!("resets in {}", human_duration(diff_secs)))
-}
-
-fn resolve_reset_time(window: &UsageWindow, now_ms: u64) -> Option<u64> {
-    if let Some(raw_reset_at) = window.reset_at {
-        let ms = if raw_reset_at > 1_000_000_000_000 {
-            raw_reset_at
-        } else {
-            raw_reset_at.saturating_mul(1000)
-        };
-        return Some(ms);
-    }
-    window.reset_after_seconds
-        .map(|after_secs| now_ms.saturating_add(after_secs.saturating_mul(1000)))
-}
-
-fn human_duration(total_seconds: u64) -> String {
-    let days = total_seconds / 86_400;
-    let hours = (total_seconds % 86_400) / 3_600;
-    let mins = (total_seconds % 3_600) / 60;
-    let secs = total_seconds % 60;
-
-    match (days, hours, mins, secs) {
-        (d, 0, 0, s) if d == 0 && s > 0 => format!("{s}s"),
-        (d, 0, m, 0) if d == 0 && m > 0 => format!("{m}m"),
-        (d, h, 0, 0) if d == 0 && h > 0 => format!("{h}h"),
-        (d, 0, 0, 0) if d == 0 => "0s".to_string(),
-        (d, h, m, 0) if d > 0 => format!("{d}d {h}h"),
-        (d, h, m, s) if d > 0 && h > 0 && m > 0 => format!("{d}d {h}h {m}m"),
-        (0, h, m, s) if h > 0 && m > 0 => format!("{h}h {m}m {s}s"),
-        (d, h, 0, s) if d > 0 => format!("{d}d {h}h {s}s"),
-        (0, h, 0, s) if h > 0 => format!("{h}h {s}s"),
-        (0, 0, m, s) => format!("{m}m {s}s"),
-        _ => format!("{}s", total_seconds),
-fn human_duration(total_seconds: u64) -> String {
-    if total_seconds == 0 {
-        return "0s".to_string();
-    }
-
-    let days = total_seconds / 86_400;
-    let hours = (total_seconds % 86_400) / 3_600;
-    let mins = (total_seconds % 3_600) / 60;
-    let secs = total_seconds % 60;
-
-    let mut parts = Vec::new();
-    if days > 0 {
-        parts.push(format!("{days}d"));
-    }
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if mins > 0 {
-        parts.push(format!("{mins}m"));
-    }
-    if secs > 0 {
-        parts.push(format!("{secs}s"));
-    }
-
-    if parts.is_empty() {
-        return "0s".to_string();
-    }
-
-    let shown_parts = parts.into_iter().take(3).collect::<Vec<_>>();
-    shown_parts.join(" ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::human_duration;
-
-    #[test]
-    fn human_duration_keeps_day_hour_minute_for_90060() {
-        assert_eq!(human_duration(90060), "1d 1h 1m");
-    }
-
-    #[test]
-    fn human_duration_keeps_day_minute_second_for_86461() {
-        assert_eq!(human_duration(86461), "1d 1m 1s");
-    }
-
-    #[test]
-    fn human_duration_keeps_zero_minutes_when_necessary() {
-        assert_eq!(human_duration(90000), "1d 1h");
-    }
-}
-
-fn parse_jwt_claim(token: &str, top: &str, inner: &str) -> Option<String> {
-        (0, h, 0, s) if h > 0 => format!("{h}h {s}s"),
-        (0, 0, m, s) => format!("{m}m {s}s"),
-    let bytes = URL_SAFE.decode(payload).ok()?;
-    }
+    let bytes = URL_SAFE.decode(&payload).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn now_millis() -> u64 {
@@ -2241,12 +1812,12 @@ fn now_millis() -> u64 {
 fn as_string(value: &Value) -> Option<String> {
     value.as_str().map(str::to_string)
 }
-    let mut payload = payload.to_string();
-    while !payload.len().is_multiple_of(4) {
-        payload.push('=');
-    }
-    let bytes = URL_SAFE.decode(&payload).ok()?;
-    serde_json::from_slice(&bytes).ok()
+
+fn as_bool(value: &Value) -> Option<bool> {
+    value.as_bool()
+}
+
+fn as_f64(value: &Value) -> Option<f64> {
     if let Some(v) = value.as_f64() {
         return Some(v);
     }
