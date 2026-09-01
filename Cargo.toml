@@ -1,0 +1,20 @@
+[package]
+name = "codex-usage"
+version = "0.1.0"
+edition = "2021"
+authors = ["Codex Usage CLI"]
+description = "Small Rust CLI to show OpenAI Codex plan usage from ~/.codex/auth.json"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+config = "0.14"
+indicatif = "0.17"
+platform-dirs = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[profile.release]
+strip = true
