@@ -7,7 +7,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde_json::{Map, Value};
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, IsTerminal, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,212 +23,199 @@ const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const JWT_PROFILE_CLAIM: &str = "https://api.openai.com/profile";
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_BOLD: &str = "\x1b[1m";
-#[derive(Copy, Clone)]
+
+#[derive(Clone, Copy)]
 struct Theme {
     name: &'static str,
-    bar_ok: &'static str,
+    /// indicatif-style color name used for status word text
     bar_warning: &'static str,
     bar_exhausted: &'static str,
     bar_unknown: &'static str,
-    bar_empty: &'static str,
+    /// truecolor ANSI: theme primary used for the bar fill
+    bar_primary: &'static str,
+    /// truecolor ANSI: muted same-hue secondary for the unfilled region
+    bar_background: &'static str,
     meter_color: &'static str,
     window_color: &'static str,
     reset_color: &'static str,
-    error_color: &'static str,
 }
 
 const BUILTIN_THEMES: &[Theme] = &[
     Theme {
-        bar_ok: "green",
+        name: "default",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "blue",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;39m",
         window_color: "\x1b[38;5;243m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
-        name: "default",
+        bar_primary: "\x1b[38;2;63;185;80m",
+        bar_background: "\x1b[38;2;41;92;50m",
     },
     Theme {
         name: "solarized-dark",
-        bar_ok: "bright_cyan",
         bar_warning: "bright_yellow",
         bar_exhausted: "red",
         bar_unknown: "bright_blue",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;75m",
         window_color: "\x1b[38;5;144m",
         reset_color: "\x1b[38;5;245m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;42;161;152m",
+        bar_background: "\x1b[38;2;24;88;84m",
     },
     Theme {
         name: "solarized-light",
-        bar_ok: "blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;33m",
         window_color: "\x1b[38;5;101m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;38;139;210m",
+        bar_background: "\x1b[38;2;190;213;233m",
     },
     Theme {
         name: "monokai",
-        bar_ok: "green",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "magenta",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;77m",
         window_color: "\x1b[38;5;180m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;166;226;46m",
+        bar_background: "\x1b[38;2;85;102;34m",
     },
     Theme {
         name: "molokai",
-        bar_ok: "bright_green",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "magenta",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;148m",
         window_color: "\x1b[38;5;244m",
         reset_color: "\x1b[38;5;245m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;184;230;62m",
+        bar_background: "\x1b[38;2;92;104;40m",
     },
     Theme {
         name: "dracula",
-        bar_ok: "bright_magenta",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "bright_cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;141m",
         window_color: "\x1b[38;5;103m",
         reset_color: "\x1b[38;5;243m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;189;147;249m",
+        bar_background: "\x1b[38;2;88;70;120m",
     },
     Theme {
         name: "gruvbox-dark",
-        bar_ok: "yellow",
         bar_warning: "bright_yellow",
         bar_exhausted: "bright_red",
         bar_unknown: "cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;214m",
         window_color: "\x1b[38;5;180m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;250;189;47m",
+        bar_background: "\x1b[38;2;110;88;24m",
     },
     Theme {
         name: "gruvbox-light",
-        bar_ok: "blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "magenta",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;66m",
         window_color: "\x1b[38;5;59m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;7;102;120m",
+        bar_background: "\x1b[38;2;180;205;211m",
     },
     Theme {
         name: "one-dark",
-        bar_ok: "bright_green",
         bar_warning: "bright_yellow",
         bar_exhausted: "bright_red",
         bar_unknown: "bright_cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;114m",
         window_color: "\x1b[38;5;181m",
         reset_color: "\x1b[38;5;245m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;152;195;121m",
+        bar_background: "\x1b[38;2;70;95;60m",
     },
     Theme {
         name: "one-light",
-        bar_ok: "green",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "blue",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;28m",
         window_color: "\x1b[38;5;101m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;80;161;79m",
+        bar_background: "\x1b[38;2;196;220;196m",
     },
     Theme {
         name: "nord",
-        bar_ok: "bright_cyan",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "blue",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;74m",
         window_color: "\x1b[38;5;104m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;136;192;208m",
+        bar_background: "\x1b[38;2;62;90;99m",
     },
     Theme {
         name: "github-dark",
-        bar_ok: "bright_green",
         bar_warning: "yellow",
         bar_exhausted: "bright_red",
         bar_unknown: "blue",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;47m",
         window_color: "\x1b[38;5;249m",
         reset_color: "\x1b[38;5;240m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;63;185;80m",
+        bar_background: "\x1b[38;2;40;86;48m",
     },
     Theme {
         name: "github-light",
-        bar_ok: "blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;24m",
         window_color: "\x1b[38;5;244m",
         reset_color: "\x1b[38;5;244m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;9;105;218m",
+        bar_background: "\x1b[38;2;200;216;240m",
     },
     Theme {
         name: "nord-dark",
-        bar_ok: "bright_blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "magenta",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;117m",
         window_color: "\x1b[38;5;152m",
         reset_color: "\x1b[38;5;245m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;94;129;172m",
+        bar_background: "\x1b[38;2;52;72;97m",
     },
     Theme {
         name: "catppuccin-mocha",
-        bar_ok: "bright_magenta",
         bar_warning: "yellow",
         bar_exhausted: "bright_red",
         bar_unknown: "cyan",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;141m",
         window_color: "\x1b[38;5;103m",
         reset_color: "\x1b[38;5;243m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;203;166;247m",
+        bar_background: "\x1b[38;2;90;74;114m",
     },
     Theme {
         name: "tokyo-night",
-        bar_ok: "bright_blue",
         bar_warning: "yellow",
         bar_exhausted: "red",
         bar_unknown: "magenta",
-        bar_empty: "bright_black",
         meter_color: "\x1b[38;5;110m",
         window_color: "\x1b[38;5;246m",
         reset_color: "\x1b[38;5;242m",
-        error_color: "\x1b[31m",
+        bar_primary: "\x1b[38;2;122;162;247m",
+        bar_background: "\x1b[38;2;58;78;116m",
     },
 ];
 
@@ -387,6 +374,7 @@ struct ParsedUsage {
     rate_limit: Option<RateLimit>,
     additional_rate_limits: Vec<AdditionalRateLimit>,
     reset_credits_available: Option<u64>,
+    reset_credits: Option<Vec<ResetCredit>>,
     raw: Value,
 }
 
@@ -491,6 +479,7 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
         .build()
         .map_err(|e| e.to_string())?;
 
+    let use_progress = use_progress && output_is_interactive();
     let spinner = if use_progress {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
@@ -506,23 +495,9 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
     };
 
     let request = |auth: &AuthRecord| -> AppResult<reqwest::blocking::Response> {
-        let mut headers = HeaderMap::new();
-        let bearer = format!("Bearer {}", auth.access_token);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&bearer).map_err(|e| e.to_string())?,
-        );
-        headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
-        if let Some(account_id) = &auth.account_id {
-            headers.insert(
-                "ChatGPT-Account-Id",
-                HeaderValue::from_str(account_id).map_err(|e| e.to_string())?,
-            );
-        }
-
         client
             .get(&url)
-            .headers(headers)
+            .headers(build_headers(auth)?)
             .send()
             .map_err(|e| format!("usage request failed: {e}"))
     };
@@ -531,11 +506,18 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
     let first_status = first_response.status();
 
     if first_status.is_success() {
+        let payload = first_response.json().map_err(|e| e.to_string())?;
+        let mut usage = parse_usage_payload(payload);
+        if usage.reset_credits_available.unwrap_or(0) > 0 {
+            if let Some(pb) = &spinner {
+                pb.set_message("Fetching banked reset credits…");
+            }
+            usage.reset_credits = fetch_reset_credits(&client, &base, auth);
+        }
         if let Some(pb) = &spinner {
             pb.finish_and_clear();
         }
-        let payload = first_response.json().map_err(|e| e.to_string())?;
-        return Ok(parse_usage_payload(payload));
+        return Ok(usage);
     }
 
     let first_body = first_response
@@ -550,20 +532,23 @@ fn fetch_usage(cli: &Cli, auth: &mut AuthRecord, use_progress: bool) -> AppResul
             Ok(()) => {
                 let second_response = request(auth)?;
                 if second_response.status().is_success() {
+                    let payload = second_response.json().map_err(|e| e.to_string())?;
+                    let mut usage = parse_usage_payload(payload);
+                    if usage.reset_credits_available.unwrap_or(0) > 0 {
+                        if let Some(pb) = &spinner {
+                            pb.set_message("Fetching banked reset credits…");
+                        }
+                        usage.reset_credits = fetch_reset_credits(&client, &base, auth);
+                    }
                     if let Some(pb) = &spinner {
                         pb.finish_and_clear();
                     }
-                    let payload = second_response.json().map_err(|e| e.to_string())?;
-                    return Ok(parse_usage_payload(payload));
+                    return Ok(usage);
                 }
-
                 let second_status = second_response.status();
                 let second_body = second_response
                     .text()
                     .unwrap_or_else(|_| "unable to read response body".to_string());
-                if let Some(pb) = &spinner {
-                    pb.finish_and_clear();
-                }
                 return Err(format!(
                     "usage endpoint returned HTTP {} after refresh: {}",
                     second_status,
@@ -599,6 +584,52 @@ struct TempAuthFile {
     remove_on_drop: bool,
 }
 
+fn build_headers(auth: &AuthRecord) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    let bearer = format!("Bearer {}", auth.access_token);
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&bearer).map_err(|e| e.to_string())?,
+    );
+    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
+    if let Some(account_id) = &auth.account_id {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            HeaderValue::from_str(account_id).map_err(|e| e.to_string())?,
+        );
+    }
+    Ok(headers)
+}
+
+fn fetch_reset_credits(client: &Client, base: &str, auth: &AuthRecord) -> Option<Vec<ResetCredit>> {
+    let url = format!("{base}/wham/rate-limit-reset-credits");
+    let response = client
+        .get(&url)
+        .headers(build_headers(auth).ok()?)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let payload: Value = response.json().ok()?;
+    let credits = payload.get("credits")?.as_array()?;
+    Some(
+        credits
+            .iter()
+            .filter_map(|credit| {
+                let obj = credit.as_object()?;
+                Some(ResetCredit {
+                    title: obj
+                        .get("title")
+                        .and_then(as_string)
+                        .filter(|title| !title.trim().is_empty()),
+                    expires_at_ms: obj.get("expires_at").and_then(parse_timestamp_to_ms),
+                })
+            })
+            .collect(),
+    )
+}
 impl TempAuthFile {
     fn new(path: PathBuf) -> Self {
         Self {
@@ -865,25 +896,28 @@ fn parse_jwt_aud(token: &str) -> Option<String> {
     None
 }
 
+#[derive(Clone)]
+struct ResetCredit {
+    title: Option<String>,
+    expires_at_ms: Option<u64>,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct BankReset {
     source: String,
     expires_in: String,
 }
 
+fn output_is_interactive() -> bool {
+    std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
+}
+
 fn print_usage_report(usage: &ParsedUsage, auth: &AuthRecord, theme: &Theme, use_progress: bool) {
+    let use_progress = use_progress && output_is_interactive();
     println!("{}", colorize(theme.meter_color, "Codex plan usage"));
-    println!("{}", colorize(theme.meter_color, "================"));
+    println!("{}", colorize(theme.window_color, "================"));
 
     println!("{}", format_account_plan_line(auth, usage, theme));
-
-    if let Some(credits) = usage.reset_credits_available {
-        println!(
-            "{} {}",
-            colorize(theme.window_color, "Reset credits:"),
-            colorize(theme.meter_color, &credits.to_string())
-        );
-    }
     println!();
 
     let now_ms = now_millis();
@@ -897,7 +931,7 @@ fn print_usage_report(usage: &ParsedUsage, auth: &AuthRecord, theme: &Theme, use
         render_usage_item(&item, theme, use_progress);
     }
 
-    print_banked_resets(&collect_banked_resets(usage, now_ms), theme);
+    print_banked_resets(&collect_banked_resets(usage, now_ms), theme, use_progress);
 }
 
 fn format_account_plan_line(auth: &AuthRecord, usage: &ParsedUsage, theme: &Theme) -> String {
@@ -913,54 +947,34 @@ fn format_account_plan_line(auth: &AuthRecord, usage: &ParsedUsage, theme: &Them
 fn collect_banked_resets(payload: &ParsedUsage, now_ms: u64) -> Vec<BankReset> {
     let mut resets = Vec::new();
 
-    if let Some(rate_limit) = &payload.rate_limit {
-        if let Some(window) = &rate_limit.primary_window {
-            push_banked_reset(
-                &mut resets,
-                format_window_labelled_source("Codex", window),
-                reset_expiration_text(window, now_ms),
-            );
+    match &payload.reset_credits {
+        Some(credits) => {
+            for credit in credits {
+                let label = credit
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "Reset credit".to_string());
+                let expires_in = match credit.expires_at_ms {
+                    Some(expires_ms) => {
+                        let diff_secs =
+                            (expires_ms.saturating_sub(now_ms) / 1000).clamp(0, u64::MAX);
+                        format!("expires in {}", human_duration(diff_secs))
+                    }
+                    None => "no expiry reported".to_string(),
+                };
+                push_banked_reset(&mut resets, label, Some(expires_in));
+            }
         }
-        if let Some(window) = &rate_limit.secondary_window {
-            push_banked_reset(
-                &mut resets,
-                format_window_labelled_source("Codex", window),
-                reset_expiration_text(window, now_ms),
-            );
-        }
-    }
-
-    for extra in &payload.additional_rate_limits {
-        let slug = additional_limit_slug(
-            extra.limit_name.as_deref(),
-            extra.metered_feature.as_deref(),
-        );
-        let display_name = match slug.as_str() {
-            "spark" => "Spark".to_string(),
-            "chat" => "Codex".to_string(),
-            _ => extra
-                .limit_name
-                .as_ref()
-                .map(|name| normalize_usage_label(name))
-                .unwrap_or_else(|| title_case_slug(&slug)),
-        };
-        let Some(rate_limit) = &extra.rate_limit else {
-            continue;
-        };
-
-        if let Some(window) = &rate_limit.primary_window {
-            push_banked_reset(
-                &mut resets,
-                format_window_labelled_source(&display_name, window),
-                reset_expiration_text(window, now_ms),
-            );
-        }
-        if let Some(window) = &rate_limit.secondary_window {
-            push_banked_reset(
-                &mut resets,
-                format_window_labelled_source(&display_name, window),
-                reset_expiration_text(window, now_ms),
-            );
+        None => {
+            if let Some(count) = payload.reset_credits_available {
+                if count > 0 {
+                    push_banked_reset(
+                        &mut resets,
+                        format!("Reset credits available: {count}"),
+                        Some("expiry not reported".to_string()),
+                    );
+                }
+            }
         }
     }
 
@@ -971,43 +985,27 @@ fn push_banked_reset(resets: &mut Vec<BankReset>, source: String, expiration: Op
     let Some(expires_in) = expiration else {
         return;
     };
-    let item = BankReset { source, expires_in };
-    if !resets.iter().any(|known| known == &item) {
-        resets.push(item);
-    }
+    resets.push(BankReset { source, expires_in });
 }
 
-fn format_window_labelled_source(display_name: &str, window: &UsageWindow) -> String {
-    let window_label = window_label(window.limit_window_seconds).to_lowercase();
-    if window_label == "unknown" {
-        display_name.to_string()
-    } else {
-        format!("{display_name} ({window_label})")
-    }
-}
-
-fn reset_expiration_text(window: &UsageWindow, now_ms: u64) -> Option<String> {
-    let reset_ms = resolve_reset_time(window, now_ms)?;
-    let diff_secs = (reset_ms.saturating_sub(now_ms) / 1000).clamp(0, u64::MAX);
-    Some(format!("expires in {}", human_duration(diff_secs)))
-}
-
-fn print_banked_resets(resets: &[BankReset], theme: &Theme) {
+fn print_banked_resets(resets: &[BankReset], theme: &Theme, bar_mode: bool) {
     if resets.is_empty() {
         return;
     }
 
-    println!();
-    println!("{}", colorize(theme.window_color, "Bank resets"));
+    if bar_mode {
+        let _ = std::io::stderr().write_all(b"\n");
+    } else {
+        println!();
+    }
+    println!("{}", colorize(theme.meter_color, "Bank resets"));
     println!("{}", colorize(theme.window_color, "------------"));
     for reset in resets {
         println!(
-            "  {} {}",
+            "  {} {} — {}",
             colorize(theme.window_color, "•"),
-            colorize(
-                theme.window_color,
-                &format!("{} — {}", reset.source, reset.expires_in),
-            )
+            colorize(theme.meter_color, &reset.source),
+            colorize(theme.reset_color, &reset.expires_in)
         );
     }
 }
@@ -1044,6 +1042,7 @@ fn collect_items(payload: &ParsedUsage, now_ms: u64) -> Vec<UsageItem> {
         let display_name = match slug.as_str() {
             "spark" => "Spark".to_string(),
             "chat" => "Codex".to_string(),
+            "gpt-reserve" => "Reserve".to_string(),
             _ => extra
                 .limit_name
                 .as_ref()
@@ -1093,22 +1092,20 @@ fn build_usage_item(
 }
 
 fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
-    let status_label = match item.status {
-        UsageStatus::Ok => None,
-        UsageStatus::Warning => Some("warning"),
-        UsageStatus::Exhausted => Some("exhausted"),
-        UsageStatus::Unknown => Some("unknown"),
+    let (status_label, status_color) = match item.status {
+        UsageStatus::Ok => (None, ""),
+        UsageStatus::Warning => (Some("warning"), ansi_color_from_name(theme.bar_warning)),
+        UsageStatus::Exhausted => (Some("exhausted"), ansi_color_from_name(theme.bar_exhausted)),
+        UsageStatus::Unknown => (Some("unknown"), ansi_color_from_name(theme.bar_unknown)),
     };
-    let (bar_fill, bar_empty) = match item.status {
-        UsageStatus::Ok => (theme.bar_ok, theme.bar_empty),
-        UsageStatus::Warning => (theme.bar_warning, theme.bar_empty),
-        UsageStatus::Exhausted => (theme.bar_exhausted, theme.bar_empty),
-        UsageStatus::Unknown => (theme.bar_unknown, theme.bar_empty),
-    };
-    let meter = fit_width(&item.meter, 8);
+    // Bar always draws in the theme's primary hue; the muted secondary
+    // is reserved for the unfilled region. Status differences show in the
+    // status word, not the bar color.
+    let bar_primary = theme.bar_primary;
+    let meter = fit_width(&item.meter, 12);
     let window = fit_width(&item.window_label, 11);
     let prefix = format!(
-        "{ANSI_BOLD}{meter_color}{meter}{ANSI_RESET} {window_color}({window}){ANSI_RESET}",
+        "{ANSI_BOLD}{meter_color}{meter}{ANSI_RESET} {window_color}({window}){ANSI_RESET} ",
         meter_color = theme.meter_color,
         window_color = theme.window_color
     );
@@ -1117,18 +1114,18 @@ fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
         Some(percent_raw) => {
             let percent = percent_raw.clamp(0.0, 100.0);
             let filled = (percent.round() as u64).min(100);
-            let mut line = format!("{percent:>5.1}%");
+            let mut line = colorize(theme.meter_color, &format!("{percent:>5.1}%"));
             if let Some(reset_text) = &item.reset_text {
                 line.push(' ');
                 line.push_str(&colorize(theme.reset_color, reset_text));
             }
             if let Some(status) = status_label {
                 line.push(' ');
-                line.push_str(&colorize(theme.error_color, status));
+                line.push_str(&colorize(status_color, status));
             }
 
             if use_progress {
-                render_usage_bar(&prefix, &line, bar_fill, bar_empty, filled);
+                render_usage_bar(&prefix, &line, bar_primary, theme.bar_background, filled);
             } else {
                 println!("{:<22} {}", prefix, line);
             }
@@ -1141,7 +1138,7 @@ fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
             }
             if let Some(status) = status_label {
                 line.push(' ');
-                line.push_str(&colorize(theme.error_color, status));
+                line.push_str(&colorize(status_color, status));
             }
             if use_progress {
                 println!("{: <22} {}", prefix, line);
@@ -1152,44 +1149,55 @@ fn render_usage_item(item: &UsageItem, theme: &Theme, use_progress: bool) {
     }
 }
 
-fn render_usage_bar(prefix: &str, line: &str, bar_fill: &str, bar_empty: &str, filled: u64) {
-    let bar = ProgressBar::new(100);
-    render_usage_bar_with_width(&bar, 44, prefix, line, bar_fill, bar_empty, filled);
-}
-
-fn render_usage_bar_with_width(
-    bar: &ProgressBar,
-    width: usize,
+fn render_usage_bar(
     prefix: &str,
     line: &str,
-    bar_fill: &str,
-    bar_empty: &str,
+    bar_primary: &str,
+    bar_background: &str,
     filled: u64,
 ) {
-    let template = format!(
-        "{{prefix:<19}} {{bar:{width}.{bar_fill}/{bar_empty}}} {{msg}}",
-        width = width,
-        bar_fill = bar_fill,
-        bar_empty = bar_empty
-    );
-    let bar_style = ProgressStyle::with_template(&template)
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("█▓▒░ ");
-    bar.set_style(bar_style);
-    bar.set_prefix(prefix.to_string());
-    bar.set_message(line.to_string());
-    bar.set_position(filled);
-    bar.abandon();
+    let bar = render_bar_cells(44, bar_primary, bar_background, filled);
+    println!("{prefix:<22}{bar} {line}");
+}
+
+/// 4-level bar: solid/dark/medium shades in the theme primary, the
+/// fractional cell interpolating ▒→▓ with the remainder, and the unfilled
+/// region in the theme's muted same-hue secondary.
+fn render_bar_cells(width: usize, fill_ansi: &str, background_ansi: &str, filled: u64) -> String {
+    let filled_units = (filled as f64 / 100.0) * width as f64;
+    let whole = (filled_units.floor() as usize).min(width);
+    let frac = filled_units - whole as f64;
+
+    let mut out = String::with_capacity(width * 4);
+    out.push_str(fill_ansi);
+    for _ in 0..whole {
+        out.push('█');
+    }
+
+    let mut partial = 0;
+    if whole < width && frac > 0.0 {
+        // fraction picks among the middle chars, exactly like the tester:
+        // emptier shade for small remainders, most-filled near the boundary
+        let current = ['▒', '▓'];
+        let idx = ((frac * current.len() as f64) as usize).min(current.len() - 1);
+        out.push(current[current.len() - 1 - idx]);
+        partial = 1;
+    }
+    out.push_str(ANSI_RESET);
+
+    let empty_count = width - whole - partial;
+    if empty_count > 0 {
+        out.push_str(background_ansi);
+        for _ in 0..empty_count {
+            out.push('░');
+        }
+        out.push_str(ANSI_RESET);
+    }
+    out
 }
 
 fn normalize_usage_label(name: &str) -> String {
     let normalized = name.trim().to_lowercase();
-    if normalized == "chat" {
-        return "Codex".to_string();
-    }
-    if normalized == "spark" {
-        return "Spark".to_string();
-    }
     title_case_slug(&slugify(&normalized))
 }
 
@@ -1200,6 +1208,28 @@ fn fit_width(value: &str, width: usize) -> String {
         truncated
     } else {
         format!("{truncated}{}", " ".repeat(pad))
+    }
+}
+
+fn ansi_color_from_name(name: &str) -> &'static str {
+    match name {
+        "black" => "\x1b[30m",
+        "red" => "\x1b[31m",
+        "green" => "\x1b[32m",
+        "yellow" => "\x1b[33m",
+        "blue" => "\x1b[34m",
+        "magenta" => "\x1b[35m",
+        "cyan" => "\x1b[36m",
+        "white" => "\x1b[37m",
+        "bright_black" => "\x1b[90m",
+        "bright_red" => "\x1b[91m",
+        "bright_green" => "\x1b[92m",
+        "bright_yellow" => "\x1b[93m",
+        "bright_blue" => "\x1b[94m",
+        "bright_magenta" => "\x1b[95m",
+        "bright_cyan" => "\x1b[96m",
+        "bright_white" => "\x1b[97m",
+        _ => "",
     }
 }
 
@@ -1238,6 +1268,7 @@ fn parse_usage_payload(payload: Value) -> ParsedUsage {
         rate_limit,
         additional_rate_limits,
         reset_credits_available,
+        reset_credits: None,
         raw: payload,
     }
 }
@@ -1346,8 +1377,13 @@ fn additional_limit_slug(limit_name: Option<&str>, metered_feature: Option<&str>
         metered_feature.unwrap_or("")
     )
     .to_lowercase();
+    let probe = probe.trim();
     if probe.contains("spark") || probe.contains("bengalfox") {
         return "spark".to_string();
+    }
+
+    if probe.contains("gpt-reserve") {
+        return "gpt-reserve".to_string();
     }
 
     let source = metered_feature
@@ -1487,127 +1523,50 @@ fn human_duration(total_seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        additional_limit_slug, collect_banked_resets, format_account_plan_line, human_duration,
-        now_millis, persist_auth, render_usage_bar_with_width, AdditionalRateLimit, AuthRecord,
-        ParsedUsage, RateLimit, UsageWindow, BUILTIN_THEMES,
+        additional_limit_slug, collect_banked_resets, collect_items, fit_width,
+        format_account_plan_line, human_duration, now_millis, parse_timestamp_to_ms, persist_auth,
+        render_bar_cells, AdditionalRateLimit, AuthRecord, ParsedUsage, RateLimit, ResetCredit,
+        UsageWindow, BUILTIN_THEMES,
     };
-    use indicatif::{ProgressBar, ProgressDrawTarget, TermLike};
     use std::env;
-    use std::fmt;
     use std::fs;
-    use std::io;
-    use std::sync::{Arc, Mutex};
 
-    #[derive(Clone, Default)]
-    struct RecordingTerm {
-        output: Arc<Mutex<String>>,
-    }
+    #[test]
+    fn render_bar_cells_shades_fill_and_background() {
+        let bar = render_bar_cells(10, "\x1b[32m", "\x1b[38;5;59m", 42);
 
-    impl RecordingTerm {
-        fn new() -> Self {
-            Self::default()
-        }
-
-        fn contents(&self) -> String {
-            self.output.lock().unwrap().clone()
-        }
-    }
-
-    impl fmt::Debug for RecordingTerm {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("RecordingTerm").finish()
-        }
-    }
-
-    impl TermLike for RecordingTerm {
-        fn width(&self) -> u16 {
-            120
-        }
-
-        fn height(&self) -> u16 {
-            24
-        }
-
-        fn move_cursor_up(&self, _n: usize) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn move_cursor_down(&self, _n: usize) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn move_cursor_right(&self, _n: usize) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn move_cursor_left(&self, _n: usize) -> io::Result<()> {
-            Ok(())
-        }
-
-        fn write_line(&self, s: &str) -> io::Result<()> {
-            let mut output = self.output.lock().unwrap();
-            output.push_str(s);
-            output.push('\n');
-            Ok(())
-        }
-
-        fn write_str(&self, s: &str) -> io::Result<()> {
-            let mut output = self.output.lock().unwrap();
-            output.push_str(s);
-            Ok(())
-        }
-
-        fn clear_line(&self) -> io::Result<()> {
-            let mut output = self.output.lock().unwrap();
-            output.push_str("\r\x1b[2K");
-            Ok(())
-        }
-
-        fn flush(&self) -> io::Result<()> {
-            Ok(())
-        }
+        let filled_cells = bar.chars().filter(|c| matches!(c, '█' | '▓' | '▒')).count();
+        let empty_cells = bar.chars().filter(|c| *c == '░').count();
+        assert_eq!(filled_cells + empty_cells, 10, "cells must sum to width");
+        assert!(filled_cells > 0, "partial bar should include fill chars");
+        assert!(filled_cells < 10, "bar should not be fully filled at 42%");
+        assert!(empty_cells > 0, "unfilled area must use background color");
+        assert!(
+            bar.contains("\x1b[32m"),
+            "fill region carries theme primary"
+        );
+        assert!(
+            bar.contains("\x1b[38;5;59m"),
+            "unfilled region carries background color"
+        );
     }
 
     #[test]
-    fn progress_bar_abandon_keeps_partial_fill_and_message() {
-        let term = RecordingTerm::new();
-        let bar = ProgressBar::with_draw_target(
-            Some(100),
-            ProgressDrawTarget::term_like(Box::new(term.clone())),
-        );
-        render_usage_bar_with_width(&bar, 10, "Codex (7 days)", " 42.0%", "green", "black", 42);
-
-        assert_eq!(bar.position(), 42);
-        assert_eq!(bar.message(), " 42.0%");
-
-        let output = term.contents();
-        assert!(output.contains("Codex (7 days)"));
-        assert!(output.contains("42.0%"));
-
-        let last_rendered_frame = output
-            .split("\r\x1b[2K")
-            .filter(|frame| !frame.is_empty())
-            .filter(|frame| frame.contains('█'))
-            .last()
-            .expect("progress bar frame should be captured");
-        let bar_start = last_rendered_frame
-            .find('█')
-            .expect("bar should render a filled segment");
-        let msg_start = last_rendered_frame
-            .rfind("42.0%")
-            .expect("message should be rendered with progress bar");
-        assert!(bar_start < msg_start, "bar should render before message");
-        let bar_segment = &last_rendered_frame[bar_start..msg_start];
-
-        let filled_cells = bar_segment
-            .chars()
-            .filter(|c| matches!(c, '█' | '▉' | '▊' | '▌' | '▓' | '▒' | '░'))
-            .count();
-        let empty_cells = bar_segment.chars().filter(|c| *c == ' ').count();
-
-        assert!(filled_cells > 0, "partial bar should include fill chars");
-        assert!(filled_cells < 10, "bar should not be fully filled at 42%");
-        assert!(empty_cells > 0, "partial bar should include unfilled width");
+    fn render_bar_cells_extremes_have_no_partial_cell() {
+        for filled in [0u64, 100u64] {
+            let bar = render_bar_cells(10, "\x1b[31m", "\x1b[38;5;59m", filled);
+            assert_eq!(
+                bar.chars()
+                    .filter(|c| matches!(c, '█' | '▓' | '▒' | '░'))
+                    .count(),
+                10,
+                "bar renders exactly width cells at {filled}%"
+            );
+        }
+        let full = render_bar_cells(10, "\x1b[31m", "\x1b[38;5;59m", 100);
+        assert_eq!(full.chars().filter(|c| *c == '█').count(), 10);
+        let empty = render_bar_cells(10, "\x1b[31m", "\x1b[38;5;59m", 0);
+        assert_eq!(empty.chars().filter(|c| *c == '░').count(), 10);
     }
     #[test]
     fn format_account_plan_line_hides_account_id_and_keeps_email_with_plan() {
@@ -1624,6 +1583,7 @@ mod tests {
             rate_limit: None,
             additional_rate_limits: vec![],
             reset_credits_available: None,
+            reset_credits: None,
             raw: serde_json::Value::Null,
         };
 
@@ -1635,36 +1595,80 @@ mod tests {
     }
 
     #[test]
-    fn collect_banked_resets_collects_known_sources_with_expiration() {
+    fn additional_limit_display_uses_real_names() {
+        // spark/chat keep canonical display names via the slug mapping;
+        // anything else normalizes the limit name, never underscore-slug
         let usage = ParsedUsage {
             plan_type: Some("prolite".to_string()),
-            rate_limit: Some(RateLimit {
-                allowed: Some(true),
-                limit_reached: Some(false),
-                primary_window: Some(UsageWindow {
-                    used_percent: Some(42.0),
-                    limit_window_seconds: Some(86_400),
-                    reset_after_seconds: Some(3_600),
-                    reset_at: None,
-                }),
-                secondary_window: None,
-            }),
-            additional_rate_limits: vec![AdditionalRateLimit {
-                limit_name: Some("codex_spark".to_string()),
-                metered_feature: None,
-                rate_limit: Some(RateLimit {
-                    allowed: Some(true),
-                    limit_reached: Some(false),
-                    primary_window: Some(UsageWindow {
-                        used_percent: Some(10.0),
-                        limit_window_seconds: Some(30 * 60),
-                        reset_after_seconds: Some(900),
-                        reset_at: None,
+            rate_limit: None,
+            additional_rate_limits: vec![
+                AdditionalRateLimit {
+                    limit_name: Some("GPT-Reserve".to_string()),
+                    metered_feature: None,
+                    rate_limit: Some(RateLimit {
+                        allowed: Some(true),
+                        limit_reached: Some(false),
+                        primary_window: Some(UsageWindow {
+                            used_percent: Some(10.0),
+                            limit_window_seconds: Some(604_800),
+                            reset_after_seconds: Some(900),
+                            reset_at: None,
+                        }),
+                        secondary_window: None,
                     }),
-                    secondary_window: None,
-                }),
-            }],
+                },
+                AdditionalRateLimit {
+                    limit_name: None,
+                    metered_feature: Some("codex_extra_feature".to_string()),
+                    rate_limit: Some(RateLimit {
+                        allowed: Some(true),
+                        limit_reached: Some(false),
+                        primary_window: Some(UsageWindow {
+                            used_percent: Some(20.0),
+                            limit_window_seconds: Some(86_400),
+                            reset_after_seconds: Some(1_800),
+                            reset_at: None,
+                        }),
+                        secondary_window: None,
+                    }),
+                },
+            ],
             reset_credits_available: None,
+            reset_credits: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let items = collect_items(&usage, 0);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].meter, "Reserve");
+        assert_eq!(items[1].meter, "Extra Feature");
+    }
+
+    #[test]
+    fn window_label_fits_prefix_geometry() {
+        // 8-char meter + space + parens + 11-char window = 22 visible cols
+        let window = fit_width("7 days", 11);
+        assert_eq!(window.chars().count(), 11);
+        assert_eq!(fit_width(&"x".repeat(20), 11).chars().count(), 11);
+    }
+
+    #[test]
+    fn collect_banked_resets_itemizes_credits_with_expiry() {
+        let usage = ParsedUsage {
+            plan_type: Some("prolite".to_string()),
+            rate_limit: None,
+            additional_rate_limits: vec![],
+            reset_credits_available: Some(2),
+            reset_credits: Some(vec![
+                ResetCredit {
+                    title: Some("Weekly reset".to_string()),
+                    expires_at_ms: Some(3_600_000),
+                },
+                ResetCredit {
+                    title: None,
+                    expires_at_ms: Some(900_000),
+                },
+            ]),
             raw: serde_json::Value::Null,
         };
 
@@ -1672,12 +1676,88 @@ mod tests {
         assert_eq!(resets.len(), 2);
         assert!(resets
             .iter()
-            .any(|item| item.source == "Codex (1 day)" && item.expires_in == "expires in 1h"));
-        assert!(
-            resets
-                .iter()
-                .any(|item| item.source == "Spark (30 minutes)"
-                    && item.expires_in == "expires in 15m")
+            .any(|item| item.source == "Weekly reset" && item.expires_in == "expires in 1h"));
+        assert!(resets
+            .iter()
+            .any(|item| item.source == "Reset credit" && item.expires_in == "expires in 15m"));
+    }
+
+    #[test]
+    fn collect_banked_resets_keeps_identical_looking_credits_distinct() {
+        let usage = ParsedUsage {
+            plan_type: Some("prolite".to_string()),
+            rate_limit: None,
+            additional_rate_limits: vec![],
+            reset_credits_available: Some(2),
+            reset_credits: Some(vec![
+                ResetCredit {
+                    title: Some("Full reset".to_string()),
+                    expires_at_ms: Some(3_600_000),
+                },
+                ResetCredit {
+                    title: Some("Full reset".to_string()),
+                    expires_at_ms: Some(3_600_000),
+                },
+            ]),
+            raw: serde_json::Value::Null,
+        };
+
+        let resets = collect_banked_resets(&usage, 0);
+        assert_eq!(
+            resets.len(),
+            2,
+            "distinct API credits with identical title+expiry must each render"
+        );
+    }
+
+    #[test]
+    fn collect_banked_resets_falls_back_to_count_without_details() {
+        let usage = ParsedUsage {
+            plan_type: Some("prolite".to_string()),
+            rate_limit: None,
+            additional_rate_limits: vec![],
+            reset_credits_available: Some(2),
+            reset_credits: None,
+            raw: serde_json::Value::Null,
+        };
+
+        let resets = collect_banked_resets(&usage, 0);
+        assert_eq!(resets.len(), 1);
+        assert_eq!(resets[0].source, "Reset credits available: 2");
+        assert_eq!(resets[0].expires_in, "expiry not reported");
+    }
+
+    #[test]
+    fn collect_banked_resets_empty_when_no_credits() {
+        let usage = ParsedUsage {
+            plan_type: Some("prolite".to_string()),
+            rate_limit: None,
+            additional_rate_limits: vec![],
+            reset_credits_available: Some(0),
+            reset_credits: None,
+            raw: serde_json::Value::Null,
+        };
+
+        assert!(collect_banked_resets(&usage, 0).is_empty());
+    }
+
+    #[test]
+    fn parse_timestamp_handles_epoch_and_rfc3339() {
+        assert_eq!(
+            parse_timestamp_to_ms(&serde_json::json!(1_788_295_133)),
+            Some(1_788_295_133_000)
+        );
+        assert_eq!(
+            parse_timestamp_to_ms(&serde_json::json!("1788295133")),
+            Some(1_788_295_133_000)
+        );
+        assert_eq!(
+            parse_timestamp_to_ms(&serde_json::json!("2026-09-01T00:00:00Z")),
+            Some(1_788_220_800_000)
+        );
+        assert_eq!(
+            parse_timestamp_to_ms(&serde_json::json!("not-a-time")),
+            None
         );
     }
 
@@ -1807,6 +1887,111 @@ fn now_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn parse_timestamp_to_ms(value: &Value) -> Option<u64> {
+    let raw_secs = match value {
+        Value::Number(_) => as_u64(value)?,
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            if trimmed.chars().all(|c| c.is_ascii_digit()) {
+                trimmed.parse::<u64>().ok()?
+            } else {
+                return parse_rfc3339_to_ms(trimmed);
+            }
+        }
+        _ => return None,
+    };
+    Some(if raw_secs > 1_000_000_000_000 {
+        raw_secs
+    } else {
+        raw_secs.saturating_mul(1000)
+    })
+}
+
+fn parse_rfc3339_to_ms(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let year: i64 = text.get(0..4)?.parse().ok()?;
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let month: i64 = text.get(5..7)?.parse().ok()?;
+    let day: i64 = text.get(8..10)?.parse().ok()?;
+    if !matches!(bytes[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let hour: i64 = text.get(11..13)?.parse().ok()?;
+    if bytes[13] != b':' {
+        return None;
+    }
+    let minute: i64 = text.get(14..16)?.parse().ok()?;
+    if bytes[16] != b':' {
+        return None;
+    }
+    let second: i64 = text.get(17..19)?.parse().ok()?;
+
+    let mut rest = &text[19..];
+    let mut millis: i64 = 0;
+    if let Some(fraction) = rest.strip_prefix('.') {
+        let digits: usize = fraction.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        let fraction_value: f64 = format!("0.{}", &fraction[..digits]).parse().ok()?;
+        millis = (fraction_value * 1000.0).round() as i64;
+        rest = &fraction[digits..];
+    }
+
+    let offset_secs: i64 = match rest {
+        "Z" | "z" => 0,
+        _ => {
+            let sign = match rest.chars().next()? {
+                '+' => 1,
+                '-' => -1,
+                _ => return None,
+            };
+            let offset = rest.get(1..6)?;
+            if offset.as_bytes()[2] != b':' {
+                return None;
+            }
+            let offset_hours: i64 = offset.get(0..2)?.parse().ok()?;
+            let offset_minutes: i64 = offset.get(3..5)?.parse().ok()?;
+            sign * (offset_hours * 3_600 + offset_minutes * 60)
+        }
+    };
+
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+
+    let day_secs = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second
+        - offset_secs;
+    Some(
+        (day_secs as u64)
+            .saturating_mul(1000)
+            .saturating_add(millis as u64),
+    )
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_of_year = (month + 9) % 12;
+    let day_of_year = (153 * month_of_year + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 fn as_string(value: &Value) -> Option<String> {
