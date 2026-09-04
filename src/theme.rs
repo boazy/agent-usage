@@ -1,4 +1,4 @@
-use anstyle::{Ansi256Color, AnsiColor, Color, Effects, RgbColor, Style};
+use anstyle::{Ansi256Color, AnsiColor, Color, RgbColor, Style};
 
 #[derive(Clone, Copy)]
 pub(crate) struct Theme {
@@ -24,8 +24,6 @@ const fn rgb(red: u8, green: u8, blue: u8) -> Style {
 const fn ansi(color: AnsiColor) -> Style {
     Style::new().fg_color(Some(Color::Ansi(color)))
 }
-
-pub(crate) const BOLD: Style = Style::new().effects(Effects::BOLD);
 
 pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     Theme {
@@ -219,11 +217,4 @@ pub(crate) fn theme_by_name(name: &str) -> Option<Theme> {
         .iter()
         .find(|theme| theme.name.eq_ignore_ascii_case(name))
         .copied()
-}
-
-pub(crate) fn paint(style: Style, text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    format!("{}{text}{}", style.render(), style.render_reset())
 }

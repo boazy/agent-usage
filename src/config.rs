@@ -23,7 +23,9 @@ pub(crate) struct SourceConfig {
     pub(crate) optional: bool,
 }
 
-const fn enabled_by_default() -> bool { true }
+const fn enabled_by_default() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -74,17 +76,26 @@ impl Default for DashboardConfig {
 impl DashboardConfig {
     pub(crate) fn load(path: Option<&Path>) -> Result<Self> {
         if path.is_some_and(|path| !path.is_file()) {
-            return Err(eyre!("explicit configuration file is missing or is not a regular file"));
+            return Err(eyre!(
+                "explicit configuration file is missing or is not a regular file"
+            ));
         }
         let path = path.map_or_else(default_config_path, |path| Some(path.to_path_buf()));
         let mut builder = ::config::Config::builder();
         if let Some(path) = path.filter(|path| path.exists()) {
             builder = builder.add_source(::config::File::from(path));
         }
-        builder = builder.add_source(::config::Environment::with_prefix("AGENT_USAGE")
-            .prefix_separator("_").separator("__").try_parsing(true));
-        let result: Self = builder.build().wrap_err("failed to load dashboard configuration")?
-            .try_deserialize().wrap_err("invalid dashboard configuration")?;
+        builder = builder.add_source(
+            ::config::Environment::with_prefix("AGENT_USAGE")
+                .prefix_separator("_")
+                .separator("__")
+                .try_parsing(true),
+        );
+        let result: Self = builder
+            .build()
+            .wrap_err("failed to load dashboard configuration")?
+            .try_deserialize()
+            .wrap_err("invalid dashboard configuration")?;
         result.validate()?;
         Ok(result)
     }
@@ -130,8 +141,20 @@ pub(crate) fn default_sources() -> Vec<SourceConfig> {
     let directory = default_omp_directory();
     let omp = omp_credential_path(&directory);
     vec![
-        SourceConfig { name: "codex".to_owned(), kind: SourceKind::Codex, path: codex, enabled: true, optional: true },
-        SourceConfig { name: "omp".to_owned(), kind: SourceKind::Omp, path: omp, enabled: true, optional: true },
+        SourceConfig {
+            name: "codex".to_owned(),
+            kind: SourceKind::Codex,
+            path: codex,
+            enabled: true,
+            optional: true,
+        },
+        SourceConfig {
+            name: "omp".to_owned(),
+            kind: SourceKind::Omp,
+            path: omp,
+            enabled: true,
+            optional: true,
+        },
     ]
 }
 
@@ -139,31 +162,48 @@ fn omp_credential_path(directory: &Path) -> PathBuf {
     let database = directory.join("agent.db");
     // Current OMP stores credentials exclusively in SQLite. A leftover legacy
     // file must never resurrect accounts deleted or rotated in that database.
-    if database.exists() { database } else { directory.join("auth.json") }
+    if database.exists() {
+        database
+    } else {
+        directory.join("auth.json")
+    }
 }
 
 fn default_omp_directory() -> PathBuf {
     let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from);
-    let root_name = std::env::var_os("PI_CONFIG_DIR").filter(|value| !value.is_empty())
+    let root_name = std::env::var_os("PI_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
         .unwrap_or_else(|| ".omp".into());
     let mut root = home.join(root_name);
-    let profile = std::env::var("OMP_PROFILE").or_else(|_| std::env::var("PI_PROFILE"))
-        .ok().filter(|profile| !profile.trim().is_empty() && profile.trim() != "default");
+    let profile = std::env::var("OMP_PROFILE")
+        .or_else(|_| std::env::var("PI_PROFILE"))
+        .ok()
+        .filter(|profile| !profile.trim().is_empty() && profile.trim() != "default");
     if let Some(profile) = &profile {
         // Invalid profiles are rejected by OMP itself. Do not interpret them as paths.
-        if !profile.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-            || matches!(profile.as_str(), "." | "..") {
+        if !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || matches!(profile.as_str(), "." | "..")
+        {
             return root.join("agent");
         }
         root = root.join("profiles").join(profile);
-    } else if let Some(directory) = std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty()) {
+    } else if let Some(directory) =
+        std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+    {
         return PathBuf::from(directory);
     }
     if cfg!(any(target_os = "linux", target_os = "macos")) {
-        if let Some(directory) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        if let Some(directory) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty())
+        {
             let mut xdg = PathBuf::from(directory).join("omp");
-            if let Some(profile) = profile { xdg = xdg.join("profiles").join(profile); }
-            if xdg.exists() { return xdg; }
+            if let Some(profile) = profile {
+                xdg = xdg.join("profiles").join(profile);
+            }
+            if xdg.exists() {
+                return xdg;
+            }
         }
     }
     root.join("agent")
@@ -171,11 +211,20 @@ fn default_omp_directory() -> PathBuf {
 
 pub(crate) fn validate_key_pattern(pattern: &str) -> Result<()> {
     let Some((prefix, suffix)) = pattern.split_once('*') else {
-        return Err(eyre!("API-key exclusion must contain one '*' between a visible prefix and suffix"));
+        return Err(eyre!(
+            "API-key exclusion must contain one '*' between a visible prefix and suffix"
+        ));
     };
-    if suffix.contains('*') || prefix.len() > 4 || suffix.len() > 4
-        || prefix.len() + suffix.len() < 4 || !pattern.is_ascii()
-        || !prefix.bytes().chain(suffix.bytes()).all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) {
+    if suffix.contains('*')
+        || prefix.len() > 4
+        || suffix.len() > 4
+        || prefix.len() + suffix.len() < 4
+        || !pattern.is_ascii()
+        || !prefix
+            .bytes()
+            .chain(suffix.bytes())
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
         return Err(eyre!("API-key exclusion must use 4–8 visible ASCII characters, at most four on each side of one '*'"));
     }
     Ok(())
@@ -201,8 +250,12 @@ mod tests {
     #[test]
     fn explicit_empty_source_list_disables_default_discovery() -> Result<()> {
         let config: DashboardConfig = ::config::Config::builder()
-            .add_source(::config::File::from_str("sources = []", ::config::FileFormat::Toml))
-            .build()?.try_deserialize()?;
+            .add_source(::config::File::from_str(
+                "sources = []",
+                ::config::FileFormat::Toml,
+            ))
+            .build()?
+            .try_deserialize()?;
         assert!(config.sources.is_empty());
         Ok(())
     }
@@ -214,10 +267,19 @@ mod tests {
             ("AGENT_USAGE_CONCURRENCY".to_owned(), "3".to_owned()),
         ]);
         let config: DashboardConfig = ::config::Config::builder()
-            .add_source(::config::File::from_str("sources = []", ::config::FileFormat::Toml))
-            .add_source(::config::Environment::with_prefix("AGENT_USAGE")
-                .prefix_separator("_").separator("__").try_parsing(true).source(Some(environment)))
-            .build()?.try_deserialize()?;
+            .add_source(::config::File::from_str(
+                "sources = []",
+                ::config::FileFormat::Toml,
+            ))
+            .add_source(
+                ::config::Environment::with_prefix("AGENT_USAGE")
+                    .prefix_separator("_")
+                    .separator("__")
+                    .try_parsing(true)
+                    .source(Some(environment)),
+            )
+            .build()?
+            .try_deserialize()?;
         assert_eq!(config.theme, "monokai");
         assert_eq!(config.concurrency, 3);
         Ok(())

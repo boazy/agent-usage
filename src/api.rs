@@ -82,25 +82,34 @@ pub(crate) fn normalize_base_url(input: &str) -> Result<String> {
         || url.fragment().is_some()
         || !matches!(url.path().trim_end_matches('/'), "" | "/backend-api")
     {
-        return Err(eyre!("Codex credentials require an official HTTPS ChatGPT backend URL"));
+        return Err(eyre!(
+            "Codex credentials require an official HTTPS ChatGPT backend URL"
+        ));
     }
-    Ok(format!("{}/backend-api", url.origin().ascii_serialization()))
+    Ok(format!(
+        "{}/backend-api",
+        url.origin().ascii_serialization()
+    ))
 }
 
 fn ensure_supported(provider: &Provider, auth: &AuthRecord) -> Result<()> {
     match (provider, auth.kind) {
-        (Provider::Codex, CredentialKind::OAuth)
-        | (Provider::Claude, CredentialKind::OAuth)
-        | (Provider::Antigravity, CredentialKind::OAuth)
+        (Provider::Codex | Provider::Claude | Provider::Antigravity, CredentialKind::OAuth)
         | (Provider::OpenRouter, CredentialKind::ApiKey) => {}
         (Provider::Codex, CredentialKind::ApiKey) => {
-            return Err(eyre!("unsupported: Codex API keys do not expose subscription usage"));
+            return Err(eyre!(
+                "unsupported: Codex API keys do not expose subscription usage"
+            ));
         }
         (Provider::Claude, CredentialKind::ApiKey) => {
-            return Err(eyre!("unsupported: ordinary Claude API keys do not expose subscription usage"));
+            return Err(eyre!(
+                "unsupported: ordinary Claude API keys do not expose subscription usage"
+            ));
         }
         (Provider::Antigravity, CredentialKind::ApiKey) => {
-            return Err(eyre!("unsupported: Antigravity quota requires OAuth credentials"));
+            return Err(eyre!(
+                "unsupported: Antigravity quota requires OAuth credentials"
+            ));
         }
         (Provider::OpenRouter, CredentialKind::OAuth) => {
             return Err(eyre!("unsupported: OpenRouter usage requires an API key"));
@@ -108,12 +117,19 @@ fn ensure_supported(provider: &Provider, auth: &AuthRecord) -> Result<()> {
         (Provider::Other(_), _) => return Err(eyre!("unsupported billing provider")),
     }
     if auth.access_token.is_empty() || auth.access_token == "__remote__" {
-        return Err(eyre!("no local access credential; sign in through the owning source"));
+        return Err(eyre!(
+            "no local access credential; sign in through the owning source"
+        ));
     }
     if *provider == Provider::Antigravity
-        && auth.project_id.as_deref().is_none_or(|id| id.trim().is_empty())
+        && auth
+            .project_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
     {
-        return Err(eyre!("Antigravity OAuth credentials require a stored project ID"));
+        return Err(eyre!(
+            "Antigravity OAuth credentials require a stored project ID"
+        ));
     }
     Ok(())
 }
@@ -147,7 +163,10 @@ async fn fetch_with_endpoints(
 ) -> Result<AccountUsage> {
     ensure_supported(provider, auth)?;
     let expired = auth.kind == CredentialKind::OAuth
-        && auth.expires_at.zip(now_ms()).is_some_and(|(expiry, now)| expiry <= now);
+        && auth
+            .expires_at
+            .zip(now_ms())
+            .is_some_and(|(expiry, now)| expiry <= now);
     if expired {
         refresh(client, provider, auth, endpoints).await?;
     }
@@ -186,7 +205,9 @@ async fn fetch_once(
 }
 
 fn refresh_token(auth: &AuthRecord) -> Option<&str> {
-    auth.refresh_token.as_deref().filter(|token| !token.is_empty() && *token != "__remote__")
+    auth.refresh_token
+        .as_deref()
+        .filter(|token| !token.is_empty() && *token != "__remote__")
 }
 
 async fn refresh(
@@ -195,17 +216,22 @@ async fn refresh(
     auth: &mut AuthRecord,
     endpoints: &Endpoints<'_>,
 ) -> Result<()> {
-    let token = refresh_token(auth)
-        .ok_or_else(|| eyre!("OAuth token needs refresh but no local refresh token is available"))?;
+    let token = refresh_token(auth).ok_or_else(|| {
+        eyre!("OAuth token needs refresh but no local refresh token is available")
+    })?;
     let request = match provider {
         Provider::Codex => client.post(endpoints.codex_token).form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", token),
             ("client_id", auth.default_oauth_client_id()),
         ]),
-        Provider::Claude => client.post(endpoints.claude_token)
+        Provider::Claude => client
+            .post(endpoints.claude_token)
             .header("anthropic-beta", "oauth-2025-04-20")
-            .header(USER_AGENT, "anthropic-sdk-typescript/0.112.1 userOAuthProvider")
+            .header(
+                USER_AGENT,
+                "anthropic-sdk-typescript/0.112.1 userOAuthProvider",
+            )
             .json(&json!({
                 "grant_type": "refresh_token", "refresh_token": token,
                 "client_id": CLAUDE_CLIENT_ID,
@@ -216,9 +242,13 @@ async fn refresh(
             ("client_id", ANTIGRAVITY_CLIENT_ID),
             ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
         ]),
-        Provider::OpenRouter | Provider::Other(_) => return Err(eyre!("unsupported OAuth refresh provider")),
+        Provider::OpenRouter | Provider::Other(_) => {
+            return Err(eyre!("unsupported OAuth refresh provider"))
+        }
     };
-    let payload = request_json(request).await.map_err(|error| eyre!("OAuth refresh: {error}"))?;
+    let payload = request_json(request)
+        .await
+        .map_err(|error| eyre!("OAuth refresh: {error}"))?;
     let access = text(&payload, "access_token")
         .filter(|value| *value != "__remote__")
         .ok_or_else(|| eyre!("OAuth refresh returned no usable access token"))?;
@@ -226,8 +256,9 @@ async fn refresh(
         apply_refresh_payload(auth, &payload)
             .map_err(|_| eyre!("OAuth refresh returned incomplete credentials"))?;
     } else {
-        auth.access_token = access.to_owned();
-        if let Some(token) = text(&payload, "refresh_token").filter(|value| *value != "__remote__") {
+        access.clone_into(&mut auth.access_token);
+        if let Some(token) = text(&payload, "refresh_token").filter(|value| *value != "__remote__")
+        {
             auth.refresh_token = Some(token.to_owned());
         }
         if let Some(token) = text(&payload, "id_token") {
@@ -235,7 +266,9 @@ async fn refresh(
         }
     }
     // Do not retain the expired timestamp when a refresh omits its lifetime.
-    auth.expires_at = payload.get("expires_in").and_then(integer)
+    auth.expires_at = payload
+        .get("expires_in")
+        .and_then(integer)
         .filter(|seconds| *seconds >= 0)
         .and_then(|seconds| now_ms()?.checked_add(seconds.checked_mul(1_000)?));
     Ok(())
@@ -258,47 +291,71 @@ impl fmt::Display for HttpError {
             Self::Status(status) => write!(formatter, "endpoint returned HTTP {}", status.as_u16()),
             Self::Timeout => formatter.write_str("request timed out"),
             Self::Transport => formatter.write_str("could not contact endpoint"),
-            Self::InvalidCredential => formatter.write_str("credential cannot be used as an HTTP header"),
+            Self::InvalidCredential => {
+                formatter.write_str("credential cannot be used as an HTTP header")
+            }
             Self::Oversized => formatter.write_str("response exceeded the size limit"),
             Self::InvalidJson => formatter.write_str("endpoint returned invalid JSON"),
-            Self::InvalidPayload => formatter.write_str("endpoint did not report recognized usage data"),
+            Self::InvalidPayload => {
+                formatter.write_str("endpoint did not report recognized usage data")
+            }
         }
     }
 }
 
 fn transport_error(error: &reqwest::Error) -> HttpError {
-    if error.is_timeout() { HttpError::Timeout } else { HttpError::Transport }
+    if error.is_timeout() {
+        HttpError::Timeout
+    } else {
+        HttpError::Transport
+    }
 }
 
-fn authorized(request: RequestBuilder, auth: &AuthRecord, user_agent: &'static str)
-    -> std::result::Result<RequestBuilder, HttpError>
-{
+fn authorized(
+    request: RequestBuilder,
+    auth: &AuthRecord,
+    user_agent: &'static str,
+) -> std::result::Result<RequestBuilder, HttpError> {
     let mut bearer = HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
         .map_err(|_| HttpError::InvalidCredential)?;
     bearer.set_sensitive(true);
-    Ok(request.header(AUTHORIZATION, bearer)
-        .header(ACCEPT, "application/json").header(USER_AGENT, user_agent))
+    Ok(request
+        .header(AUTHORIZATION, bearer)
+        .header(ACCEPT, "application/json")
+        .header(USER_AGENT, user_agent))
 }
 
 async fn request_json(request: RequestBuilder) -> std::result::Result<Value, HttpError> {
     tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let mut response = request.timeout(REQUEST_TIMEOUT).send().await
+        let mut response = request
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
             .map_err(|error| transport_error(&error))?;
         if !response.status().is_success() {
             return Err(HttpError::Status(response.status()));
         }
-        if response.content_length().is_some_and(|length| length > 1_048_576) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > 1_048_576)
+        {
             return Err(HttpError::Oversized);
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|error| transport_error(&error))? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| transport_error(&error))?
+        {
             if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
                 return Err(HttpError::Oversized);
             }
             bytes.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&bytes).map_err(|_| HttpError::InvalidJson)
-    }).await.map_err(|_| HttpError::Timeout)?
+    })
+    .await
+    .map_err(|_| HttpError::Timeout)?
 }
 
 fn now_ms() -> Option<i64> {
@@ -314,7 +371,10 @@ fn timestamp(value: &Value) -> Option<i64> {
 }
 
 fn number(value: &Value) -> Option<f64> {
-    value.as_f64().or_else(|| value.as_str()?.parse().ok()).filter(|number| number.is_finite())
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .filter(|number| number.is_finite())
 }
 
 fn nonnegative(value: &Value) -> Option<f64> {
@@ -326,11 +386,16 @@ fn integer(value: &Value) -> Option<i64> {
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key)?.as_str().filter(|text| !text.trim().is_empty())
+    value
+        .get(key)?
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn percent_metric(name: String, percent: Option<f64>, resets_at: Option<i64>) -> UsageMetric {
-    let percent = percent.filter(|number| number.is_finite()).map(|number| number.clamp(0.0, 100.0));
+    let percent = percent
+        .filter(|number| number.is_finite())
+        .map(|number| number.clamp(0.0, 100.0));
     UsageMetric {
         name,
         used_percent: percent,
@@ -344,8 +409,11 @@ fn percent_metric(name: String, percent: Option<f64>, resets_at: Option<i64>) ->
 fn spending_metric(name: String, used: Option<f64>, limit: Option<f64>, unit: &str) -> UsageMetric {
     UsageMetric {
         name,
-        used_percent: used.zip(limit).filter(|(_, limit)| *limit > 0.0)
-            .map(|(used, limit)| used / limit * 100.0).filter(|value| value.is_finite()),
+        used_percent: used
+            .zip(limit)
+            .filter(|(_, limit)| *limit > 0.0)
+            .map(|(used, limit)| used / limit * 100.0)
+            .filter(|value| value.is_finite()),
         used,
         limit,
         unit: Some(unit.to_owned()),

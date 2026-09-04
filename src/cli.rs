@@ -1,11 +1,10 @@
-use crate::theme::{available_theme_names, theme_by_name, Theme};
 use clap::Parser;
-use eyre::{eyre, Result};
 use std::path::PathBuf;
 
-pub(crate) const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-const DEFAULT_THEME_NAME: &str = "default";
-
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "clap models independent command-line switches; output-mode conflicts are enforced by its argument schema"
+)]
 #[derive(Debug, Parser)]
 #[command(
     name = "agent-usage",
@@ -21,7 +20,7 @@ pub(crate) struct Cli {
     #[arg(short, long, value_name = "PATH")]
     pub(crate) auth_file: Option<String>,
 
-    /// Base URL override for Codex account endpoints. Overrides configured codex_base_url only when supplied.
+    /// Base URL override for Codex account endpoints. Overrides configured `codex_base_url` only when supplied.
     #[arg(short = 'b', long)]
     pub(crate) base_url: Option<String>,
 
@@ -44,26 +43,7 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "COLUMNS")]
     pub(crate) width: Option<u16>,
 
-    /// Disable progress bars (for logs/CI).
+    /// Disable progress messages (report gauges remain visible).
     #[arg(long)]
     pub(crate) no_progress: bool,
-}
-
-pub(crate) fn resolve_theme(cli: &Cli) -> Result<Theme> {
-    let name = resolve_theme_name(cli)?;
-    theme_by_name(&name).ok_or_else(|| {
-        eyre!(
-            "unknown theme '{name}'. Supported themes: {}",
-            available_theme_names()
-        )
-    })
-}
-
-fn resolve_theme_name(cli: &Cli) -> Result<String> {
-    Ok(cli
-        .theme
-        .as_deref()
-        .unwrap_or(DEFAULT_THEME_NAME)
-        .trim()
-        .to_owned())
 }

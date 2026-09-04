@@ -38,7 +38,6 @@ pub(crate) struct ParsedUsage {
     pub(crate) rate_limit: Option<RateLimit>,
     pub(crate) additional_rate_limits: Vec<AdditionalRateLimit>,
     pub(crate) reset_credits_available: Option<u64>,
-    pub(crate) reset_credits: Option<Vec<ResetCredit>>,
     pub(crate) raw: Value,
 }
 
@@ -49,13 +48,6 @@ pub(crate) struct UsageItem {
     pub(crate) used_percent: Option<f64>,
     pub(crate) status: UsageStatus,
     pub(crate) reset_at: Option<Millis>,
-}
-
-#[derive(Clone)]
-pub(crate) struct BankReset {
-    pub(crate) source: String,
-    pub(crate) expires_at: Option<Millis>,
-    pub(crate) count: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -95,7 +87,6 @@ pub(crate) fn parse_usage_payload(payload: Value) -> ParsedUsage {
         rate_limit,
         additional_rate_limits,
         reset_credits_available,
-        reset_credits: None,
         raw: payload,
     }
 }
@@ -169,37 +160,6 @@ fn collect_rate_limit_items(
             now,
         ));
     }
-}
-
-pub(crate) fn collect_banked_resets(payload: &ParsedUsage) -> Vec<BankReset> {
-    payload.reset_credits.as_ref().map_or_else(
-        || {
-            payload
-                .reset_credits_available
-                .filter(|count| *count > 0)
-                .map(|count| {
-                    vec![BankReset {
-                        source: "Reset credits available".to_owned(),
-                        expires_at: None,
-                        count: Some(count),
-                    }]
-                })
-                .unwrap_or_default()
-        },
-        |credits| {
-            credits
-                .iter()
-                .map(|credit| BankReset {
-                    source: credit
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| "Reset credit".to_owned()),
-                    expires_at: credit.expires_at,
-                    count: None,
-                })
-                .collect()
-        },
-    )
 }
 
 fn build_usage_item(

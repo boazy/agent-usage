@@ -1,16 +1,18 @@
 use crate::api::fetch_account;
 use crate::auth::AuthRecord;
 use crate::config::{provider_matches, DashboardConfig, Exclusions, SourceConfig, SourceKind};
-use crate::sources::{acquire_refresh_guard, discover_source, persist_refreshed, DiscoveredCredential};
+use crate::sources::{
+    acquire_refresh_guard, discover_source, persist_refreshed, DiscoveredCredential,
+};
 use eyre::{Result, WrapErr};
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
 
 #[cfg(test)]
@@ -146,9 +148,12 @@ impl Dashboard {
             match discover_source(source) {
                 Ok(discovery) => {
                     warnings.extend(discovery.warnings);
-                    credentials.extend(discovery.credentials.into_iter().map(|credential| {
-                        (source.name.clone(), credential)
-                    }));
+                    credentials.extend(
+                        discovery
+                            .credentials
+                            .into_iter()
+                            .map(|credential| (source.name.clone(), credential)),
+                    );
                 }
                 Err(error) => warnings.push(format!("Source {}: {error}", safe_text(&source.name))),
             }
@@ -170,7 +175,10 @@ impl Dashboard {
             let info = account_info(&source, &credential);
             let blocked = account_excluded(&config.exclude, &info);
             let bearer = bearer_identity(&credential);
-            if let Some(&index) = indices.get(&info.id).or_else(|| bearer_indices.get(&bearer)) {
+            if let Some(&index) = indices
+                .get(&info.id)
+                .or_else(|| bearer_indices.get(&bearer))
+            {
                 indices.insert(info.id.clone(), index);
                 bearer_indices.insert(bearer, index);
                 excluded[index] |= blocked;
@@ -195,9 +203,15 @@ impl Dashboard {
             bearer_indices.insert(bearer, accounts.len());
             excluded.push(blocked);
             accounts.push(info);
-            states.push(Mutex::new(AccountState { credential, snapshot: None }));
+            states.push(Mutex::new(AccountState {
+                credential,
+                snapshot: None,
+            }));
         }
-        let (accounts, states) = accounts.into_iter().zip(states).zip(excluded)
+        let (accounts, states) = accounts
+            .into_iter()
+            .zip(states)
+            .zip(excluded)
             .filter_map(|((account, state), excluded)| (!excluded).then_some((account, state)))
             .unzip();
         let timeout = Duration::from_secs(config.timeout_seconds);
@@ -205,7 +219,11 @@ impl Dashboard {
             .timeout(timeout)
             .connect_timeout(timeout.min(Duration::from_secs(10)))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()
             .wrap_err("failed to create usage HTTP client")?;
         Ok(Self {
@@ -234,15 +252,25 @@ impl Dashboard {
     /// A global semaphore bounds concurrent calls, including overlapping refreshes.
     pub(crate) async fn refresh(&self, visible_ids: &[String]) -> Vec<AccountSnapshot> {
         let visible: HashSet<&str> = visible_ids.iter().map(String::as_str).collect();
-        let indices: Vec<usize> = self.accounts.iter().enumerate()
+        let indices: Vec<usize> = self
+            .accounts
+            .iter()
+            .enumerate()
             .filter(|(_, account)| visible.contains(account.id.as_str()))
-            .map(|(index, _)| index).collect();
-        let work = indices.into_iter().map(|index| async move { (index, self.refresh_one(index).await) });
+            .map(|(index, _)| index)
+            .collect();
+        let work = indices
+            .into_iter()
+            .map(|index| async move { (index, self.refresh_one(index).await) });
         let mut snapshots: Vec<_> = stream::iter(work)
             .buffer_unordered(self.states.len().clamp(1, 32))
-            .collect().await;
+            .collect()
+            .await;
         snapshots.sort_unstable_by_key(|(index, _)| *index);
-        snapshots.into_iter().map(|(_, snapshot)| snapshot).collect()
+        snapshots
+            .into_iter()
+            .map(|(_, snapshot)| snapshot)
+            .collect()
     }
 
     /// Stop queued fetches during shutdown without dropping an in-flight token rotation.
@@ -254,15 +282,14 @@ impl Dashboard {
         if self.stopping.load(Ordering::Acquire) {
             return failed_snapshot(&self.accounts[index], "refresh canceled during shutdown");
         }
-        let mut state = match self.states[index].try_lock() {
-            Ok(state) => state,
-            Err(_) => {
-                let state = self.states[index].lock().await;
-                if let Some(snapshot) = &state.snapshot {
-                    return snapshot.clone();
-                }
-                state
+        let mut state = if let Ok(state) = self.states[index].try_lock() {
+            state
+        } else {
+            let state = self.states[index].lock().await;
+            if let Some(snapshot) = &state.snapshot {
+                return snapshot.clone();
             }
+            state
         };
         let Ok(_permit) = self.permits.acquire().await else {
             return failed_snapshot(&self.accounts[index], "usage fetch queue closed");
@@ -275,15 +302,34 @@ impl Dashboard {
         let origin = state.credential.origin.clone();
         let lease_duration = self.timeout + Duration::from_secs(10);
         let lease = if prior.kind == CredentialKind::OAuth
-            && matches!(provider, Provider::Codex | Provider::Claude | Provider::Antigravity) {
-            match tokio::task::spawn_blocking(move || acquire_refresh_guard(&origin, lease_duration)).await {
+            && matches!(
+                provider,
+                Provider::Codex | Provider::Claude | Provider::Antigravity
+            ) {
+            match tokio::task::spawn_blocking(move || {
+                acquire_refresh_guard(&origin, lease_duration)
+            })
+            .await
+            {
                 Ok(Ok(guard)) => Some(guard),
-                Ok(Err(error)) => return failed_snapshot(&self.accounts[index], &error.to_string()),
-                Err(_) => return failed_snapshot(&self.accounts[index], "credential refresh coordination failed"),
+                Ok(Err(error)) => {
+                    return failed_snapshot(&self.accounts[index], &error.to_string())
+                }
+                Err(_) => {
+                    return failed_snapshot(
+                        &self.accounts[index],
+                        "credential refresh coordination failed",
+                    )
+                }
             }
-        } else { None };
-        let result = tokio::time::timeout(self.timeout,
-            self.fetch_current(&provider, &mut state.credential.auth)).await;
+        } else {
+            None
+        };
+        let result = tokio::time::timeout(
+            self.timeout,
+            self.fetch_current(&provider, &mut state.credential.auth),
+        )
+        .await;
         let mut warnings = Vec::new();
         if state.credential.auth.needs_persisted_refresh(&prior) {
             let mut origin = state.credential.origin.clone();
@@ -291,14 +337,19 @@ impl Dashboard {
             match tokio::task::spawn_blocking(move || {
                 let result = persist_refreshed(&mut origin, &prior, &current);
                 (origin, result)
-            }).await {
+            })
+            .await
+            {
                 Ok((origin, result)) => {
                     state.credential.origin = origin;
                     if let Err(error) = result {
                         warnings.push(format!("Refreshed credentials could not be saved: {error}"));
                     }
                 }
-                Err(_) => warnings.push("Refreshed credentials could not be saved: persistence worker failed".to_owned()),
+                Err(_) => warnings.push(
+                    "Refreshed credentials could not be saved: persistence worker failed"
+                        .to_owned(),
+                ),
             }
         }
         if let Some(lease) = lease {
@@ -320,7 +371,11 @@ impl Dashboard {
         snapshot
     }
 
-    async fn fetch_current(&self, provider: &Provider, auth: &mut AuthRecord) -> Result<AccountUsage> {
+    async fn fetch_current(
+        &self,
+        provider: &Provider,
+        auth: &mut AuthRecord,
+    ) -> Result<AccountUsage> {
         #[cfg(test)]
         if let Some(endpoint) = &self.test_endpoint {
             return crate::api::fetch_account_at(&self.client, provider, auth, endpoint).await;
@@ -340,47 +395,73 @@ fn failed_snapshot(account: &AccountInfo, message: &str) -> AccountSnapshot {
 }
 
 fn now_ms() -> Option<i64> {
-    SystemTime::now().duration_since(UNIX_EPOCH).ok()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
         .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 fn source_excluded(exclusions: &Exclusions, source: &SourceConfig) -> bool {
-    let kind = match source.kind { SourceKind::Codex => "codex", SourceKind::Omp => "omp" };
-    exclusions.sources.iter().any(|value| {
-        value.eq_ignore_ascii_case(kind) || value == &source.name
-    })
+    let kind = match source.kind {
+        SourceKind::Codex => "codex",
+        SourceKind::Omp => "omp",
+    };
+    exclusions
+        .sources
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(kind) || value == &source.name)
 }
 
 fn account_excluded(exclusions: &Exclusions, account: &AccountInfo) -> bool {
-    exclusions.providers.iter().any(|value| provider_matches(value, &account.provider))
+    exclusions
+        .providers
+        .iter()
+        .any(|value| provider_matches(value, &account.provider))
         || account.email.as_ref().is_some_and(|email| {
-            exclusions.emails.iter().any(|value| value.trim().eq_ignore_ascii_case(email))
+            exclusions
+                .emails
+                .iter()
+                .any(|value| value.trim().eq_ignore_ascii_case(email))
                 || exclusions.accounts.iter().any(|rule| {
                     rule.email.trim().eq_ignore_ascii_case(email)
                         && provider_matches(&rule.provider, &account.provider)
                 })
         })
-        || exclusions.account_ids.iter().any(|value| {
-            value == &account.id || account.account_id.as_ref() == Some(value)
-        })
+        || exclusions
+            .account_ids
+            .iter()
+            .any(|value| value == &account.id || account.account_id.as_ref() == Some(value))
         || account.masked_key.as_ref().is_some_and(|mask| {
-            exclusions.api_keys.iter().any(|pattern| masked_key_matches(pattern, mask))
+            exclusions
+                .api_keys
+                .iter()
+                .any(|pattern| masked_key_matches(pattern, mask))
         })
 }
 
 fn masked_key_matches(pattern: &str, mask: &str) -> bool {
-    let Some((prefix, suffix)) = pattern.split_once('*') else { return false; };
-    let Some((visible_prefix, visible_suffix)) = mask.split_once('*') else { return false; };
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return false;
+    };
+    let Some((visible_prefix, visible_suffix)) = mask.split_once('*') else {
+        return false;
+    };
     visible_prefix.starts_with(prefix) && visible_suffix.ends_with(suffix)
 }
 
 fn account_info(source: &str, credential: &DiscoveredCredential) -> AccountInfo {
     let auth = &credential.auth;
     let masked_key = (auth.kind == CredentialKind::ApiKey).then(|| mask_key(&auth.access_token));
-    let email = auth.email.as_deref().map(|value| safe_text(&value.trim().to_ascii_lowercase()));
+    let email = auth
+        .email
+        .as_deref()
+        .map(|value| safe_text(&value.trim().to_ascii_lowercase()));
     let account_id = auth.account_id.as_deref().map(safe_text);
-    let label = email.clone().or_else(|| account_id.clone())
-        .or_else(|| masked_key.clone()).unwrap_or_else(|| "OAuth account".to_owned());
+    let label = email
+        .clone()
+        .or_else(|| account_id.clone())
+        .or_else(|| masked_key.clone())
+        .unwrap_or_else(|| "OAuth account".to_owned());
     AccountInfo {
         id: account_identity(credential),
         provider: credential.provider.clone(),
@@ -403,15 +484,27 @@ fn account_identity(credential: &DiscoveredCredential) -> String {
         hash.update(auth.access_token.as_bytes());
     } else {
         hash.update(b"oauth\0");
-        let principal = auth.subject.clone()
-            .or_else(|| auth.email.as_ref().map(|email| email.trim().to_ascii_lowercase()))
+        let principal = auth
+            .subject
+            .clone()
+            .or_else(|| {
+                auth.email
+                    .as_ref()
+                    .map(|email| email.trim().to_ascii_lowercase())
+            })
             .or_else(|| auth.account_id.clone())
             .or_else(|| auth.project_id.clone())
             .unwrap_or_else(|| credential.origin.identity_hint());
         hash.update(principal.as_bytes());
         // One user may have independent seats in several billing organizations.
         hash.update([0]);
-        hash.update(auth.org_id.as_deref().or(auth.account_id.as_deref()).unwrap_or("").as_bytes());
+        hash.update(
+            auth.org_id
+                .as_deref()
+                .or(auth.account_id.as_deref())
+                .unwrap_or("")
+                .as_bytes(),
+        );
         hash.update([0]);
         hash.update(auth.project_id.as_deref().unwrap_or("").as_bytes());
     }
@@ -426,8 +519,15 @@ fn bearer_identity(credential: &DiscoveredCredential) -> String {
     // The same grant imported with partial metadata can enrich one account,
     // but different workspace-scoped credentials must never share a pane.
     hash.update([0]);
-    hash.update(credential.auth.org_id.as_deref()
-        .or(credential.auth.account_id.as_deref()).unwrap_or("").as_bytes());
+    hash.update(
+        credential
+            .auth
+            .org_id
+            .as_deref()
+            .or(credential.auth.account_id.as_deref())
+            .unwrap_or("")
+            .as_bytes(),
+    );
     format!("{:x}", hash.finalize())
 }
 
@@ -440,5 +540,9 @@ fn mask_key(key: &str) -> String {
 }
 
 fn safe_text(value: &str) -> String {
-    value.chars().filter(|character| !character.is_control()).take(256).collect()
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect()
 }

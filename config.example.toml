@@ -1,0 +1,48 @@
+# agent-usage configuration. This file contains no credentials.
+# Default location on macOS/Linux: ~/.config/agent-usage/config.toml
+# Explicit alternative: agent-usage --config ./config.toml
+
+theme = "default"
+concurrency = 4          # 1..32 concurrent accounts, shared across refresh calls
+timeout_seconds = 20    # 1..300; includes an account's OAuth refresh and usage calls
+refresh_seconds = 60    # TUI automatic refresh, visible panes only
+
+# Omit sources for automatic Codex + OMP discovery.
+# An existing OMP agent.db takes precedence over legacy auth.json.
+# Set sources = [] here to intentionally discover no accounts.
+
+[exclude]
+# A kind ("omp" or "codex") excludes every source of that kind.
+# A configured source name excludes only that source.
+sources = []
+providers = []          # e.g. ["antigravity"]
+emails = []             # e.g. ["personal@example.com"] across all providers
+account_ids = []        # stored account/workspace IDs or dashboard IDs from --json
+api_keys = []           # e.g. ["sk-o*1234"] or ["*1234"]; never put a full key here
+
+# Both fields must match for a provider-specific email exclusion.
+# [[exclude.accounts]]
+# email = "work@example.com"
+# provider = "claude"
+
+# Explicit sources replace automatic discovery. Repeat blocks for extra accounts.
+# Do not include a stale legacy OMP file beside its authoritative database.
+#
+# [[sources]]
+# name = "personal-codex"
+# kind = "codex"
+# path = "~/.codex/auth.json"
+# enabled = true
+# optional = true
+#
+# [[sources]]
+# name = "work-codex"
+# kind = "codex"
+# path = "~/.codex-work/auth.json"
+# optional = false
+#
+# [[sources]]
+# name = "omp"
+# kind = "omp"
+# path = "~/.omp/agent/agent.db"
+# optional = true

@@ -72,28 +72,40 @@ impl AuthRecord {
         for claims in identity.iter().chain(access.iter()) {
             if self.email.is_none() {
                 self.email = string_field(claims, "email").or_else(|| {
-                    claims.get(JWT_PROFILE_CLAIM).and_then(|profile| string_field(profile, "email"))
+                    claims
+                        .get(JWT_PROFILE_CLAIM)
+                        .and_then(|profile| string_field(profile, "email"))
                 });
             }
             if self.subject.is_none() {
                 self.subject = if *provider == Provider::Codex {
-                    claims.get(JWT_AUTH_CLAIM).and_then(|auth| {
-                        string_field(auth, "chatgpt_user_id").or_else(|| string_field(auth, "user_id"))
-                    }).or_else(|| string_field(claims, "sub"))
+                    claims
+                        .get(JWT_AUTH_CLAIM)
+                        .and_then(|auth| {
+                            string_field(auth, "chatgpt_user_id")
+                                .or_else(|| string_field(auth, "user_id"))
+                        })
+                        .or_else(|| string_field(claims, "sub"))
                 } else {
                     string_field(claims, "sub")
                 };
             }
             if *provider == Provider::Codex {
                 if self.account_id.is_none() {
-                    self.account_id = claims.get(JWT_AUTH_CLAIM)
+                    self.account_id = claims
+                        .get(JWT_AUTH_CLAIM)
                         .and_then(|auth| string_field(auth, "chatgpt_account_id"));
                 }
                 if self.oauth_client_id.is_none() {
                     self.oauth_client_id = match claims.get("aud") {
-                        Some(Value::String(value)) if value.starts_with("app_") => Some(value.clone()),
-                        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str)
-                            .find(|value| value.starts_with("app_")).map(str::to_owned),
+                        Some(Value::String(value)) if value.starts_with("app_") => {
+                            Some(value.clone())
+                        }
+                        Some(Value::Array(values)) => values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .find(|value| value.starts_with("app_"))
+                            .map(str::to_owned),
                         _ => None,
                     };
                 }
@@ -103,8 +115,11 @@ impl AuthRecord {
             self.org_id.clone_from(&self.account_id);
         }
         if self.expires_at.is_none() {
-            self.expires_at = access.as_ref().and_then(|claims| claims.get("exp"))
-                .and_then(Value::as_i64).and_then(|seconds| seconds.checked_mul(1_000));
+            self.expires_at = access
+                .as_ref()
+                .and_then(|claims| claims.get("exp"))
+                .and_then(Value::as_i64)
+                .and_then(|seconds| seconds.checked_mul(1_000));
         }
     }
 }
@@ -126,17 +141,30 @@ pub(crate) fn expand_path(path: &str) -> PathBuf {
 pub(crate) fn codex_auth_from_value(payload: &Value) -> Result<AuthRecord> {
     let mode = payload.get("auth_mode").and_then(Value::as_str);
     if mode.is_some_and(|mode| !matches!(mode, "apikey" | "chatgpt"))
-        || (mode.is_none() && ["personal_access_token", "bedrock_api_key", "bedrock_access_keys"]
-            .iter().any(|field| payload.get(*field).is_some_and(|value| !value.is_null())))
+        || (mode.is_none()
+            && [
+                "personal_access_token",
+                "bedrock_api_key",
+                "bedrock_access_keys",
+            ]
+            .iter()
+            .any(|field| payload.get(*field).is_some_and(|value| !value.is_null())))
     {
         return Err(eyre!("unsupported Codex credential kind"));
     }
-    if mode == Some("apikey") || (mode.is_none() && payload.get("OPENAI_API_KEY").is_some_and(|key| !key.is_null())) {
+    if mode == Some("apikey")
+        || (mode.is_none()
+            && payload
+                .get("OPENAI_API_KEY")
+                .is_some_and(|key| !key.is_null()))
+    {
         let key = string_field(payload, "OPENAI_API_KEY")
             .ok_or_else(|| eyre!("Codex API-key credential is missing a nonempty key"))?;
         return Ok(AuthRecord::new(key, CredentialKind::ApiKey));
     }
-    let tokens = payload.get("tokens").ok_or_else(|| eyre!("Codex OAuth credential is missing tokens"))?;
+    let tokens = payload
+        .get("tokens")
+        .ok_or_else(|| eyre!("Codex OAuth credential is missing tokens"))?;
     let access = string_field(tokens, "access_token")
         .ok_or_else(|| eyre!("Codex OAuth credential is missing a nonempty access token"))?;
     let mut auth = AuthRecord::new(access, CredentialKind::OAuth);
@@ -160,7 +188,9 @@ pub(crate) fn apply_refresh_payload(auth: &mut AuthRecord, payload: &Value) -> R
     if let Some(refresh_token) = string_field(payload, "refresh_token") {
         auth.refresh_token = Some(refresh_token);
     }
-    auth.expires_at = payload.get("expires_in").and_then(Value::as_i64)
+    auth.expires_at = payload
+        .get("expires_in")
+        .and_then(Value::as_i64)
         .filter(|seconds| *seconds >= 0)
         .and_then(|seconds| seconds.checked_mul(1_000))
         .and_then(|duration| {
@@ -172,7 +202,11 @@ pub(crate) fn apply_refresh_payload(auth: &mut AuthRecord, payload: &Value) -> R
 }
 
 pub(crate) fn string_field(value: &Value, field: &str) -> Option<String> {
-    value.get(field)?.as_str().filter(|value| !value.trim().is_empty()).map(str::to_owned)
+    value
+        .get(field)?
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_jwt(token: &str) -> Option<Value> {
@@ -217,7 +251,8 @@ mod tests {
         assert_eq!(auth.access_token, "active-key");
         assert!(codex_auth_from_value(&json!({
             "personal_access_token":"unsupported", "OPENAI_API_KEY":"stale-key"
-        })).is_err());
+        }))
+        .is_err());
         Ok(())
     }
 
@@ -240,7 +275,10 @@ mod tests {
     fn jwt_person_identity_remains_distinct_from_workspace() {
         let claims = json!({"sub":"person", "email":"fixture@example.invalid", "exp":1234,
             "https://api.openai.com/auth":{"chatgpt_account_id":"workspace", "chatgpt_user_id":"person-id"}});
-        let token = format!("header.{}.signature", URL_SAFE_NO_PAD.encode(claims.to_string()));
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        );
         let mut auth = AuthRecord::new(token, CredentialKind::OAuth);
         auth.enrich_from_tokens(&Provider::Codex);
         assert_eq!(auth.account_id.as_deref(), Some("workspace"));
