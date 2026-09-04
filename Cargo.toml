@@ -6,15 +6,30 @@ authors = ["Codex Usage CLI"]
 description = "Small Rust CLI to show OpenAI Codex plan usage from ~/.codex/auth.json"
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 base64 = "0.23"
 clap = { version = "4.5", features = ["derive"] }
+color-eyre = "0.6"
 config = "0.15"
+eyre = "0.6"
 indicatif = "0.18"
 platform-dirs = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking", "form"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+allow_attributes_without_reason = "deny"
+doc_markdown = "allow"
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+option_if_let_else = "allow"
 
 [profile.release]
 strip = true
