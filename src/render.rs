@@ -1,223 +1,300 @@
-use crate::auth::AuthRecord;
-use crate::theme::{paint, Theme, BOLD};
+use crate::dashboard::{AccountSnapshot, UsageMetric};
+use crate::theme::Theme;
 use crate::time::{now_millis, Millis};
-use crate::usage::{
-    collect_banked_resets, collect_items, human_duration, window_label, BankReset, ParsedUsage,
-    UsageItem, UsageStatus,
-};
-use anstyle::Style;
-use std::fmt::Write as _;
-use std::io::{IsTerminal, Write};
+use crate::usage::human_duration;
+use anstyle::{AnsiColor, Effects};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use std::io::{self, Write};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const METER_WIDTH: usize = 12;
-const WINDOW_WIDTH: usize = 11;
-const PREFIX_WIDTH: usize = 22;
-const BAR_WIDTH: usize = 44;
+pub(crate) const MIN_PANE_WIDTH: u16 = 44;
 
-pub(crate) fn print_usage_report(
-    usage: &ParsedUsage,
-    auth: &AuthRecord,
-    theme: Theme,
-    interactive: bool,
-) {
-    let interactive = interactive && output_is_interactive();
-    print_header("Codex plan usage", "================", theme);
-    anstream::println!("{}", format_account_plan_line(auth, usage, theme));
-    anstream::println!();
-
-    let now = now_millis();
-    let items = collect_items(usage, now);
-    if items.is_empty() {
-        anstream::println!("No usage windows were reported by this endpoint.");
-        return;
-    }
-    for item in &items {
-        render_usage_item(item, theme, interactive, now);
-    }
-    print_banked_resets(&collect_banked_resets(usage), theme, interactive, now);
+pub(crate) struct AccountPane {
+    title: Line<'static>,
+    lines: Vec<Line<'static>>,
+    border: Style,
 }
 
-fn output_is_interactive() -> bool {
-    std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
-}
-
-fn print_header(title: &str, underline: &str, theme: Theme) {
-    anstream::println!("{}", paint(theme.meter, title));
-    anstream::println!("{}", paint(theme.window, underline));
-}
-
-pub(crate) fn format_account_plan_line(
-    auth: &AuthRecord,
-    usage: &ParsedUsage,
-    theme: Theme,
-) -> String {
-    let account = auth.email.as_deref().unwrap_or("unknown");
-    let plan = usage.plan_type.as_deref().unwrap_or("unknown");
-    format!(
-        "{} {} {}",
-        paint(theme.window, "Account:"),
-        paint(theme.meter, account),
-        paint(theme.reset, &format!("({plan})"))
-    )
-}
-
-fn print_banked_resets(resets: &[BankReset], theme: Theme, interactive: bool, now: Option<Millis>) {
-    if resets.is_empty() {
-        return;
-    }
-    if interactive {
-        let _ = anstream::stderr().write_all(b"\n");
-    } else {
-        anstream::println!();
-    }
-    print_header("Bank resets", "------------", theme);
-    for reset in resets {
-        anstream::println!(
-            "  {} {} — {}",
-            paint(theme.window, "•"),
-            paint(theme.meter, &reset.source),
-            paint(theme.reset, &format_banked_reset(reset, now))
-        );
-    }
-}
-
-fn format_banked_reset(reset: &BankReset, now: Option<Millis>) -> String {
-    if let Some(count) = reset.count {
-        return format!("{count} available; expiry not reported");
-    }
-    match (reset.expires_at, now) {
-        (Some(expiry), Some(now)) => {
-            format!("expires in {}", human_duration(now.seconds_until(expiry)))
+impl AccountPane {
+    pub(crate) fn new(snapshot: &AccountSnapshot, width: u16, theme: Theme, color: bool) -> Self {
+        let inner_width = width.saturating_sub(2).max(1);
+        let mut lines = Vec::new();
+        let muted = style(theme.window, color);
+        let title = Line::from(Span::styled(
+            format!(" {} · {} ", clean(&snapshot.account.label), snapshot.account.provider),
+            style(theme.meter, color).add_modifier(Modifier::BOLD),
+        ));
+        push_wrapped(&mut lines, format!("Sources: {}", snapshot.account.sources.join(", ")), muted, inner_width);
+        if let Some(id) = &snapshot.account.account_id {
+            push_wrapped(&mut lines, format!("Account: {}", clean(id)), muted, inner_width);
         }
-        (Some(_), None) => "expiry reported; current time unavailable".to_owned(),
-        (None, _) => "no expiry reported".to_owned(),
+        if let Some(mask) = &snapshot.account.masked_key {
+            push_wrapped(&mut lines, format!("API key: {mask}"), muted, inner_width);
+        }
+        if let Some(error) = &snapshot.error {
+            push_wrapped(&mut lines, format!("Unavailable: {}", clean(error)), style(theme.exhausted, color), inner_width);
+        } else if let Some(usage) = &snapshot.usage {
+            if let Some(plan) = &usage.plan {
+                push_wrapped(&mut lines, format!("Plan: {}", clean(plan)), style(theme.meter, color), inner_width);
+            }
+            for metric in &usage.windows {
+                append_metric(&mut lines, metric, inner_width, theme, color);
+            }
+            for credit in &usage.credits {
+                push_wrapped(&mut lines, format!("{}: {} {}", clean(&credit.name), credit.balance, clean(&credit.unit)), style(theme.meter, color), inner_width);
+                if let Some(expires) = credit.expires_at {
+                    push_wrapped(&mut lines, format!("  expires {}", countdown(expires)), style(theme.reset, color), inner_width);
+                }
+            }
+            if usage.windows.is_empty() && usage.credits.is_empty() {
+                push_wrapped(&mut lines, "No quota amounts reported".to_owned(), style(theme.unknown, color), inner_width);
+            }
+        } else {
+            push_wrapped(&mut lines, "Loading…".to_owned(), style(theme.unknown, color), inner_width);
+        }
+        for warning in &snapshot.warnings {
+            push_wrapped(&mut lines, format!("Warning: {}", clean(warning)), style(theme.warning, color), inner_width);
+        }
+        Self { title, lines, border: muted }
+    }
+
+    pub(crate) fn height(&self) -> u16 {
+        u16::try_from(self.lines.len()).unwrap_or(u16::MAX - 2).saturating_add(2)
     }
 }
 
-fn render_usage_item(item: &UsageItem, theme: Theme, interactive: bool, now: Option<Millis>) {
-    let (status_label, status_style) = match item.status {
-        UsageStatus::Healthy => (None, theme.meter),
-        UsageStatus::Warning => (Some("warning"), theme.warning),
-        UsageStatus::Exhausted => (Some("exhausted"), theme.exhausted),
-        UsageStatus::Unknown => (Some("unknown"), theme.unknown),
-    };
-    let meter = fit_width(&item.meter, METER_WIDTH);
-    let window = fit_width(&window_label(item.limit_window_seconds), WINDOW_WIDTH);
-    let prefix = format!(
-        "{} {} ",
-        paint_bold(theme.meter, &meter),
-        paint(theme.window, &format!("({window})"))
+impl Widget for &AccountPane {
+    fn render(self, area: Rect, buffer: &mut Buffer) {
+        let block = Block::default().borders(Borders::ALL).border_style(self.border).title(self.title.clone());
+        let inner = block.inner(area);
+        block.render(area, buffer);
+        Paragraph::new(self.lines.clone()).render(inner, buffer);
+    }
+}
+
+fn append_metric(lines: &mut Vec<Line<'static>>, metric: &UsageMetric, width: u16, theme: Theme, color: bool) {
+    let value = metric.used_percent.filter(|value| value.is_finite()).map_or_else(
+        || match (metric.used, metric.limit) {
+            (Some(used), Some(limit)) => format!("{used:.2} / {limit:.2} {}", metric.unit.as_deref().unwrap_or("")),
+            (Some(used), None) => format!("{used:.2} {}", metric.unit.as_deref().unwrap_or("")),
+            (None, Some(limit)) => format!("limit {limit:.2} {}", metric.unit.as_deref().unwrap_or("")),
+            (None, None) => "unknown".to_owned(),
+        },
+        |percent| format!("{percent:.1}%"),
     );
-    let mut line = item.used_percent.map_or_else(
-        || "[unknown usage percentage]".to_owned(),
-        |percent| paint(theme.meter, &format!("{:>5.1}%", percent.clamp(0.0, 100.0))),
-    );
-    if let Some(reset) = item
-        .reset_at
-        .zip(now)
-        .map(|(reset, now)| format!("resets in {}", human_duration(now.seconds_until(reset))))
-    {
-        line.push(' ');
-        line.push_str(&paint(theme.reset, &reset));
+    push_wrapped(lines, format!("{}: {value}", clean(&metric.name)), style(theme.meter, color), width);
+    if let Some(percent) = metric.used_percent.filter(|value| value.is_finite()) {
+        lines.push(gauge(width, percent, style(theme.bar_primary, color), style(theme.bar_background, color)));
+        if metric.used.is_some() && metric.unit.as_deref().is_some_and(|unit| unit != "percent" && unit != "%") {
+            let amount = metric.used.unwrap_or(0.0);
+            let text = metric.limit.map_or_else(
+                || format!("  used {amount:.2} {}", metric.unit.as_deref().unwrap_or("")),
+                |limit| format!("  {amount:.2} / {limit:.2} {}", metric.unit.as_deref().unwrap_or("")),
+            );
+            push_wrapped(lines, text, style(theme.window, color), width);
+        }
     }
-    if let Some(status) = status_label {
-        line.push(' ');
-        line.push_str(&paint(status_style, status));
-    }
-
-    if interactive && item.used_percent.is_some() {
-        let filled = item.used_percent.map_or(0, rounded_percent);
-        render_usage_bar(&prefix, &line, theme, filled);
-    } else {
-        anstream::println!("{prefix:<PREFIX_WIDTH$} {line}");
+    if let Some(resets) = metric.resets_at {
+        push_wrapped(lines, format!("  resets {}", countdown(resets)), style(theme.reset, color), width);
     }
 }
 
-fn render_usage_bar(prefix: &str, line: &str, theme: Theme, filled: u64) {
-    let bar = render_bar_cells(BAR_WIDTH, theme.bar_primary, theme.bar_background, filled);
-    anstream::println!("{prefix:<PREFIX_WIDTH$}{bar} {line}");
+fn countdown(timestamp: i64) -> String {
+    let Some(then) = u64::try_from(timestamp).ok().map(Millis::new) else { return "unknown".to_owned(); };
+    now_millis().map_or_else(|| "unknown".to_owned(), |now| {
+        let seconds = now.seconds_until(then);
+        if seconds == 0 { "now".to_owned() } else { format!("in {}", human_duration(seconds)) }
+    })
 }
 
-/// The bar keeps solid, partial, and muted cells as distinct visual levels.
-fn render_bar_cells(width: usize, fill: Style, background: Style, filled: u64) -> String {
-    let filled = usize::try_from(filled.min(100)).unwrap_or(100);
-    let filled_cells = filled.saturating_mul(width);
-    let whole = filled_cells / 100;
-    let fraction = filled_cells % 100;
-    let mut output = String::with_capacity(width * 4);
-    if whole > 0 {
-        let _ = write!(&mut output, "{}", fill.render());
-        output.extend(std::iter::repeat_n('█', whole));
-        let _ = write!(&mut output, "{}", fill.render_reset());
+fn push_wrapped(lines: &mut Vec<Line<'static>>, text: String, style: Style, width: u16) {
+    let mut part = String::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        let advance = character.width().unwrap_or(0);
+        if columns + advance > usize::from(width) && !part.is_empty() {
+            lines.push(Line::from(Span::styled(std::mem::take(&mut part), style)));
+            columns = 0;
+        }
+        part.push(character);
+        columns += advance;
     }
-    let partial = usize::from(whole < width && fraction > 0);
-    if partial == 1 {
-        let cell = if fraction < 50 { '▓' } else { '▒' };
-        output.push_str(&paint(fill, &cell.to_string()));
-    }
-    let empty = width - whole - partial;
-    if empty > 0 {
-        let _ = write!(&mut output, "{}", background.render());
-        output.extend(std::iter::repeat_n('░', empty));
-        let _ = write!(&mut output, "{}", background.render_reset());
-    }
-    output
+    lines.push(Line::from(Span::styled(part, style)));
 }
 
-fn paint_bold(style: Style, text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "finite usage is clamped to the pane width before conversion")]
+fn gauge(width: u16, percent: f64, foreground: Style, background: Style) -> Line<'static> {
+    let cells = percent.clamp(0.0, 100.0) * f64::from(width) / 100.0;
+    let whole = cells.floor() as usize;
+    let remainder = cells.fract();
+    let partial = usize::from(whole < usize::from(width) && remainder > 0.0);
+    let mut spans = vec![Span::styled("█".repeat(whole), foreground)];
+    if partial != 0 {
+        spans.push(Span::styled(if remainder >= 0.5 { "▓" } else { "▒" }, foreground));
     }
-    format!(
-        "{}{}{text}{}",
-        BOLD.render(),
-        style.render(),
-        style.render_reset()
-    )
+    spans.push(Span::styled("░".repeat(usize::from(width) - whole - partial), background));
+    Line::from(spans)
 }
 
-fn fit_width(value: &str, width: usize) -> String {
-    let truncated: String = value.chars().take(width).collect();
-    format!("{truncated:<width$}")
+pub(crate) struct PlacedPane {
+    pub(crate) index: usize,
+    pub(crate) x: u16,
+    pub(crate) y: usize,
+    pub(crate) width: u16,
+    pub(crate) height: u16,
+    pub(crate) pane: AccountPane,
 }
 
-fn rounded_percent(percent: f64) -> u64 {
-    if !percent.is_finite() {
-        return 0;
+pub(crate) fn layout_panes(snapshots: &[AccountSnapshot], indices: &[usize], width: u16, theme: Theme, color: bool) -> Vec<PlacedPane> {
+    let width = width.max(1);
+    let columns = usize::from((width / MIN_PANE_WIDTH).max(1));
+    let column_count = u16::try_from(columns).unwrap_or(1);
+    let base_width = width / column_count;
+    let extra = width % column_count;
+    let mut result = Vec::with_capacity(indices.len());
+    let mut y = 0;
+    for row in indices.chunks(columns) {
+        let mut x = 0;
+        let mut row_height = 0;
+        for (column, &index) in row.iter().enumerate() {
+            let pane_width = base_width + u16::from(column < usize::from(extra));
+            let pane = AccountPane::new(&snapshots[index], pane_width, theme, color);
+            let height = pane.height();
+            row_height = row_height.max(height);
+            result.push(PlacedPane { index, x, y, width: pane_width, height, pane });
+            x += pane_width;
+        }
+        y += usize::from(row_height);
     }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the caller clamps the finite percentage to 0 through 100 before conversion"
-    )]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "the caller clamps the finite percentage to a non-negative value before conversion"
-    )]
-    {
-        percent.clamp(0.0, 100.0).round() as u64
+    result
+}
+
+pub(crate) fn report_width(explicit: Option<u16>) -> u16 {
+    explicit.or_else(|| crossterm::terminal::size().ok().map(|(width, _)| width)).unwrap_or(100).max(1)
+}
+
+pub(crate) fn color_enabled() -> bool {
+    anstream::AutoStream::auto(std::io::stdout()).current_choice() != anstream::ColorChoice::Never
+}
+
+pub(crate) fn render_report(snapshots: &[AccountSnapshot], width: u16, theme: Theme) -> io::Result<()> {
+    let color = color_enabled();
+    let indices: Vec<_> = (0..snapshots.len()).collect();
+    let panes = layout_panes(snapshots, &indices, width, theme, color);
+    let mut output = anstream::AutoStream::auto(io::stdout().lock());
+    if panes.is_empty() { return writeln!(output, "No accounts found. Check configured credential sources and exclusions."); }
+    // Stream one grid row at a time: the complete report has no terminal-height
+    // limit and never enters alternate-screen/cursor-drawing mode.
+    let mut cursor = 0;
+    while cursor < panes.len() {
+        let y = panes[cursor].y;
+        let end = cursor + panes[cursor..].iter().take_while(|pane| pane.y == y).count();
+        let row = &panes[cursor..end];
+        let height = row.iter().map(|pane| pane.height).max().unwrap_or(1);
+        let area = Rect::new(0, 0, width.max(1), height);
+        let mut buffer = Buffer::empty(area);
+        for pane in row { (&pane.pane).render(Rect::new(pane.x, 0, pane.width, pane.height), &mut buffer); }
+        write_buffer(&buffer, area, &mut output, color)?;
+        cursor = end;
     }
+    output.flush()
+}
+
+pub(crate) fn write_buffer<W: Write>(buffer: &Buffer, area: Rect, mut output: W, color: bool) -> io::Result<()> {
+    for y in area.y..area.bottom() {
+        let mut x = area.x;
+        let mut current = Style::default();
+        while x < area.right() {
+            let cell = &buffer[(x, y)];
+            let cell_style = cell.style();
+            if color && cell_style != current {
+                write!(output, "{}{}", anstyle::Reset, ansi_style(cell_style).render())?;
+                current = cell_style;
+            }
+            write!(output, "{}", cell.symbol())?;
+            let advance = u16::try_from(cell.symbol().width()).unwrap_or(1).max(1);
+            x = x.saturating_add(advance);
+        }
+        if color { write!(output, "{}", anstyle::Reset)?; }
+        writeln!(output)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn style(value: anstyle::Style, enabled: bool) -> Style {
+    if !enabled { return Style::default(); }
+    let mut result = Style::default();
+    if let Some(color) = value.get_fg_color() { result = result.fg(ratatui_color(color)); }
+    if let Some(color) = value.get_bg_color() { result = result.bg(ratatui_color(color)); }
+    if value.get_effects().contains(Effects::BOLD) { result = result.add_modifier(Modifier::BOLD); }
+    result
+}
+
+fn ratatui_color(value: anstyle::Color) -> Color {
+    match value {
+        anstyle::Color::Rgb(anstyle::RgbColor(red, green, blue)) => Color::Rgb(red, green, blue),
+        anstyle::Color::Ansi256(anstyle::Ansi256Color(index)) => Color::Indexed(index),
+        anstyle::Color::Ansi(color) => Color::Indexed(color as u8),
+    }
+}
+
+fn ansi_style(value: Style) -> anstyle::Style {
+    let mut result = anstyle::Style::new();
+    if let Some(color) = value.fg.and_then(ansi_color) { result = result.fg_color(Some(color)); }
+    if let Some(color) = value.bg.and_then(ansi_color) { result = result.bg_color(Some(color)); }
+    if value.add_modifier.contains(Modifier::BOLD) { result = result.effects(Effects::BOLD); }
+    result
+}
+
+fn ansi_color(color: Color) -> Option<anstyle::Color> {
+    Some(match color {
+        Color::Reset => return None,
+        Color::Rgb(red, green, blue) => anstyle::Color::Rgb(anstyle::RgbColor(red, green, blue)),
+        Color::Indexed(index) => anstyle::Color::Ansi256(anstyle::Ansi256Color(index)),
+        other => anstyle::Color::Ansi(match other {
+            Color::Black => AnsiColor::Black, Color::Red => AnsiColor::Red,
+            Color::Green => AnsiColor::Green, Color::Yellow => AnsiColor::Yellow,
+            Color::Blue => AnsiColor::Blue, Color::Magenta => AnsiColor::Magenta,
+            Color::Cyan => AnsiColor::Cyan, Color::Gray => AnsiColor::White,
+            Color::DarkGray => AnsiColor::BrightBlack, Color::LightRed => AnsiColor::BrightRed,
+            Color::LightGreen => AnsiColor::BrightGreen, Color::LightYellow => AnsiColor::BrightYellow,
+            Color::LightBlue => AnsiColor::BrightBlue, Color::LightMagenta => AnsiColor::BrightMagenta,
+            Color::LightCyan => AnsiColor::BrightCyan, Color::White => AnsiColor::BrightWhite,
+            _ => return None,
+        }),
+    })
+}
+
+fn clean(value: &str) -> String {
+    value.chars().filter(|character| !character.is_control()).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::render_bar_cells;
-    use crate::theme::BUILTIN_THEMES;
+    use super::{gauge, write_buffer};
+    use ratatui::{buffer::Buffer, layout::Rect, style::Style, widgets::{Paragraph, Widget}};
+    use eyre::Result;
 
     #[test]
-    fn bar_geometry_has_exact_width_at_boundaries_and_partial_fill() {
-        for filled in [0, 42, 100] {
-            let bar = render_bar_cells(
-                10,
-                BUILTIN_THEMES[0].bar_primary,
-                BUILTIN_THEMES[0].bar_background,
-                filled,
-            );
-            assert_eq!(
-                bar.chars()
-                    .filter(|character| matches!(character, '█' | '▓' | '▒' | '░'))
-                    .count(),
-                10
-            );
+    fn wide_glyph_serializes_once_and_report_never_moves_cursor() -> Result<()> {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new("界x").render(area, &mut buffer);
+        let mut output = Vec::new();
+        write_buffer(&buffer, area, &mut output, false)?;
+        assert_eq!(String::from_utf8(output)?, "界x   \n");
+        Ok(())
+    }
+
+    #[test]
+    fn gauge_has_exact_cell_width_and_four_distinct_levels() {
+        for (percent, expected) in [(0.0, "░░░░░░░░░░"), (42.0, "████▒░░░░░"), (46.0, "████▓░░░░░"), (100.0, "██████████")] {
+            let line = gauge(10, percent, Style::default(), Style::default());
+            assert_eq!(line.to_string(), expected);
         }
     }
 }

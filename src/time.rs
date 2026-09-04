@@ -12,7 +12,6 @@ impl Millis {
         Self(value)
     }
 
-    #[cfg(test)]
     pub(crate) const fn get(self) -> u64 {
         self.0
     }

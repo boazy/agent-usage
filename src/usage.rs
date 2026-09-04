@@ -106,6 +106,13 @@ pub(crate) fn parse_reset_credits(payload: &Value) -> Option<Vec<ResetCredit>> {
             .iter()
             .filter_map(|credit| {
                 let object = credit.as_object()?;
+                if object
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status != "available")
+                {
+                    return None;
+                }
                 Some(ResetCredit {
                     title: object
                         .get("title")

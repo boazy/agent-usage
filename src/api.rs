@@ -1,233 +1,354 @@
 use crate::auth::{apply_refresh_payload, AuthRecord};
-use crate::cli::Cli;
-use crate::usage::{parse_reset_credits, parse_usage_payload, ParsedUsage};
-use eyre::{eyre, Result, WrapErr};
-use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::blocking::{Client, Response};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
-use serde_json::Value;
-use std::fmt::Write as _;
-use std::io::IsTerminal;
+use crate::dashboard::{AccountUsage, CredentialKind, Provider, UsageMetric};
+use crate::time::{now_millis, parse_timestamp_to_ms, Millis};
+use eyre::{eyre, Result};
+use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::{Client, RequestBuilder, StatusCode};
+use serde_json::{json, Value};
+use std::fmt;
 use std::time::Duration;
 use url::Url;
 
-const USER_AGENT_VALUE: &str = "codex-usage-rs/0.1.0";
+mod antigravity;
+mod claude;
+mod codex;
+mod openrouter;
+
+#[cfg(test)]
+mod tests;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-const RESET_CREDITS_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 1_048_576;
+const USER_AGENT_VALUE: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+// Public installed-app OAuth credentials from OMP's google-antigravity.kdl,
+// not account secrets. Google requires both on the refresh-token grant.
+const ANTIGRAVITY_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
+const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.257 (external, cli)";
+const ANTIGRAVITY_USER_AGENT: &str =
+    "antigravity/hub/2.8.0 (aidev_client; os_type=darwin; arch=arm64; cl=963137146)";
 
-pub(crate) fn fetch_usage(
-    cli: &Cli,
+// Only this module can inject endpoints. Production callers cannot redirect
+// OAuth credentials through a provider configuration or token response.
+struct Endpoints<'a> {
+    codex: &'a str,
+    claude: &'a str,
+    openrouter: &'a str,
+    antigravity: &'a str,
+    codex_token: &'a str,
+    claude_token: &'a str,
+    antigravity_token: &'a str,
+}
+
+impl<'a> Endpoints<'a> {
+    const fn production(codex: &'a str) -> Self {
+        Self {
+            codex,
+            claude: "https://api.anthropic.com/api/oauth/usage",
+            openrouter: "https://openrouter.ai/api/v1",
+            antigravity: "https://daily-cloudcode-pa.googleapis.com",
+            codex_token: "https://auth.openai.com/oauth/token",
+            claude_token: "https://api.anthropic.com/v1/oauth/token",
+            antigravity_token: "https://oauth2.googleapis.com/token",
+        }
+    }
+}
+
+pub(crate) async fn fetch_account(
+    client: &Client,
+    provider: &Provider,
     auth: &mut AuthRecord,
-    use_progress: bool,
-) -> Result<ParsedUsage> {
-    let base = normalize_base_url(&cli.base_url)?;
-    let usage_url = format!("{base}/wham/usage");
-    let client = Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .wrap_err("failed to build usage HTTP client")?;
-    let spinner = create_spinner(use_progress)?;
-    let request = |auth: &AuthRecord| -> Result<Response> {
-        client
-            .get(&usage_url)
-            .headers(build_headers(auth)?)
-            .send()
-            .wrap_err("usage request failed")
+    codex_base_url: &str,
+) -> Result<AccountUsage> {
+    ensure_supported(provider, auth)?;
+    let base = if *provider == Provider::Codex {
+        normalize_base_url(codex_base_url)?
+    } else {
+        String::new()
     };
-
-    let first_response = request(auth).inspect_err(|_| finish_spinner(spinner.as_ref()))?;
-    if first_response.status().is_success() {
-        return finish_success(first_response, &client, &base, auth, spinner.as_ref());
-    }
-    let first_status = first_response.status();
-
-    if (first_status == 401 || first_status == 403) && auth.refresh_token.is_some() {
-        if let Some(spinner) = &spinner {
-            spinner.set_message("Refreshing Codex access token…");
-        }
-        if let Err(error) = refresh_access_token(auth) {
-            finish_spinner(spinner.as_ref());
-            return Err(error.wrap_err(format!(
-                "usage endpoint returned HTTP {first_status}; token refresh failed"
-            )));
-        }
-        let second_response = request(auth).inspect_err(|_| finish_spinner(spinner.as_ref()))?;
-        if second_response.status().is_success() {
-            return finish_success(second_response, &client, &base, auth, spinner.as_ref());
-        }
-        finish_spinner(spinner.as_ref());
-        return Err(eyre!(
-            "usage endpoint returned HTTP {} after refresh",
-            second_response.status()
-        ));
-    }
-
-    finish_spinner(spinner.as_ref());
-    Err(eyre!("usage endpoint returned HTTP {first_status}"))
+    fetch_with_endpoints(client, provider, auth, &Endpoints::production(&base)).await
 }
 
 pub(crate) fn normalize_base_url(input: &str) -> Result<String> {
-    let trimmed = input.trim().trim_end_matches('/');
-    let url = Url::parse(trimmed).wrap_err("base URL must be an absolute HTTP(S) URL")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
+    let url = Url::parse(input.trim()).map_err(|_| eyre!("invalid Codex base URL"))?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("chatgpt.com" | "chat.openai.com"))
+        || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path().trim_end_matches('/'), "" | "/backend-api")
     {
-        return Err(eyre!(
-            "base URL must be an absolute HTTP(S) URL without credentials"
-        ));
+        return Err(eyre!("Codex credentials require an official HTTPS ChatGPT backend URL"));
     }
-    let host = url
-        .host_str()
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(|| eyre!("base URL must include a host"))?;
-    if host == "chatgpt.com" || host == "chat.openai.com" {
-        let mut origin = format!("{}://{host}", url.scheme());
-        if let Some(port) = url.port() {
-            let _ = write!(&mut origin, ":{port}");
+    Ok(format!("{}/backend-api", url.origin().ascii_serialization()))
+}
+
+fn ensure_supported(provider: &Provider, auth: &AuthRecord) -> Result<()> {
+    match (provider, auth.kind) {
+        (Provider::Codex, CredentialKind::OAuth)
+        | (Provider::Claude, CredentialKind::OAuth)
+        | (Provider::Antigravity, CredentialKind::OAuth)
+        | (Provider::OpenRouter, CredentialKind::ApiKey) => {}
+        (Provider::Codex, CredentialKind::ApiKey) => {
+            return Err(eyre!("unsupported: Codex API keys do not expose subscription usage"));
         }
-        return Ok(format!("{origin}/backend-api"));
-    }
-    Ok(trimmed.to_owned())
-}
-
-fn create_spinner(use_progress: bool) -> Result<Option<ProgressBar>> {
-    if !use_progress || !std::io::stdout().is_terminal() || !std::io::stderr().is_terminal() {
-        return Ok(None);
-    }
-    let spinner = ProgressBar::new_spinner();
-    let style = ProgressStyle::with_template("{spinner} {msg}")
-        .wrap_err("failed to configure usage spinner")?
-        .tick_strings(&["◒", "◐", "◓", "◑"]);
-    spinner.set_style(style);
-    spinner.set_message("Fetching Codex usage…");
-    spinner.enable_steady_tick(Duration::from_millis(80));
-    Ok(Some(spinner))
-}
-
-fn finish_success(
-    response: Response,
-    client: &Client,
-    base: &str,
-    auth: &AuthRecord,
-    spinner: Option<&ProgressBar>,
-) -> Result<ParsedUsage> {
-    let payload: Value = match response.json() {
-        Ok(payload) => payload,
-        Err(error) => {
-            if let Some(spinner) = spinner {
-                spinner.finish_and_clear();
-            }
-            return Err(error).wrap_err("usage endpoint returned unreadable JSON");
+        (Provider::Claude, CredentialKind::ApiKey) => {
+            return Err(eyre!("unsupported: ordinary Claude API keys do not expose subscription usage"));
         }
-    };
-    let mut usage = parse_usage_payload(payload);
-    if usage.reset_credits_available.unwrap_or(0) > 0 {
-        if let Some(spinner) = spinner {
-            spinner.set_message("Fetching banked reset credits…");
+        (Provider::Antigravity, CredentialKind::ApiKey) => {
+            return Err(eyre!("unsupported: Antigravity quota requires OAuth credentials"));
         }
-        usage.reset_credits = fetch_reset_credits(client, base, auth);
+        (Provider::OpenRouter, CredentialKind::OAuth) => {
+            return Err(eyre!("unsupported: OpenRouter usage requires an API key"));
+        }
+        (Provider::Other(_), _) => return Err(eyre!("unsupported billing provider")),
     }
-    if let Some(spinner) = spinner {
-        spinner.finish_and_clear();
+    if auth.access_token.is_empty() || auth.access_token == "__remote__" {
+        return Err(eyre!("no local access credential; sign in through the owning source"));
     }
-    Ok(usage)
-}
-
-fn finish_spinner(spinner: Option<&ProgressBar>) {
-    if let Some(spinner) = spinner {
-        spinner.finish_and_clear();
+    if *provider == Provider::Antigravity
+        && auth.project_id.as_deref().is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(eyre!("Antigravity OAuth credentials require a stored project ID"));
     }
-}
-
-fn build_headers(auth: &AuthRecord) -> Result<HeaderMap> {
-    let mut headers = HeaderMap::new();
-    let bearer = format!("Bearer {}", auth.access_token);
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&bearer).wrap_err("access token cannot be used as an HTTP header")?,
-    );
-    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
-    if let Some(account_id) = &auth.account_id {
-        headers.insert(
-            "ChatGPT-Account-Id",
-            HeaderValue::from_str(account_id)
-                .wrap_err("account ID cannot be used as an HTTP header")?,
-        );
-    }
-    Ok(headers)
-}
-
-fn fetch_reset_credits(
-    client: &Client,
-    base: &str,
-    auth: &AuthRecord,
-) -> Option<Vec<crate::usage::ResetCredit>> {
-    let response = client
-        .get(format!("{base}/wham/rate-limit-reset-credits"))
-        .headers(build_headers(auth).ok()?)
-        .timeout(RESET_CREDITS_TIMEOUT)
-        .send()
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let payload: Value = response.json().ok()?;
-    parse_reset_credits(&payload)
-}
-
-fn refresh_access_token(auth: &mut AuthRecord) -> Result<()> {
-    let refresh_token = auth
-        .refresh_token
-        .as_deref()
-        .ok_or_else(|| eyre!("authentication file is missing tokens.refresh_token"))?;
-    let client = Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .wrap_err("failed to build refresh HTTP client")?;
-    let response = client
-        .post("https://auth.openai.com/oauth/token")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", auth.default_oauth_client_id()),
-        ])
-        .send()
-        .wrap_err("token refresh request failed")?;
-    if !response.status().is_success() {
-        return Err(eyre!(
-            "token refresh endpoint returned HTTP {}",
-            response.status()
-        ));
-    }
-    let payload: Value = response
-        .json()
-        .wrap_err("token refresh endpoint returned unreadable JSON")?;
-    apply_refresh_payload(auth, &payload).wrap_err("token refresh response was incomplete")
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::normalize_base_url;
+pub(crate) async fn fetch_account_at(
+    client: &Client,
+    provider: &Provider,
+    auth: &mut AuthRecord,
+    base_url: &str,
+) -> Result<AccountUsage> {
+    let claude = format!("{base_url}/api/oauth/usage");
+    let token = format!("{base_url}/oauth/token");
+    let endpoints = Endpoints {
+        codex: base_url,
+        claude: &claude,
+        openrouter: base_url,
+        antigravity: base_url,
+        codex_token: &token,
+        claude_token: &token,
+        antigravity_token: &token,
+    };
+    fetch_with_endpoints(client, provider, auth, &endpoints).await
+}
 
-    #[test]
-    fn normalizes_official_hosts_without_losing_port() {
-        assert_eq!(
-            normalize_base_url("https://chatgpt.com/example")
-                .unwrap_or_else(|error| panic!("unexpected URL error: {error}")),
-            "https://chatgpt.com/backend-api"
-        );
-        assert_eq!(
-            normalize_base_url("https://chat.openai.com:8443/")
-                .unwrap_or_else(|error| panic!("unexpected URL error: {error}")),
-            "https://chat.openai.com:8443/backend-api"
-        );
+async fn fetch_with_endpoints(
+    client: &Client,
+    provider: &Provider,
+    auth: &mut AuthRecord,
+    endpoints: &Endpoints<'_>,
+) -> Result<AccountUsage> {
+    ensure_supported(provider, auth)?;
+    let expired = auth.kind == CredentialKind::OAuth
+        && auth.expires_at.zip(now_ms()).is_some_and(|(expiry, now)| expiry <= now);
+    if expired {
+        refresh(client, provider, auth, endpoints).await?;
     }
+    let first = fetch_once(client, provider, auth, endpoints).await;
+    match first {
+        Err(HttpError::Status(status))
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                && auth.kind == CredentialKind::OAuth
+                && !expired
+                && refresh_token(auth).is_some() =>
+        {
+            refresh(client, provider, auth, endpoints).await?;
+            // Mutations intentionally survive a failing usage request: the caller
+            // persists a rotated refresh token even when usage is unavailable.
+            fetch_once(client, provider, auth, endpoints)
+                .await
+                .map_err(|error| eyre!("usage after token refresh: {error}"))
+        }
+        result => result.map_err(|error| eyre!("usage request: {error}")),
+    }
+}
 
-    #[test]
-    fn rejects_invalid_or_credentialed_base_urls() {
-        assert!(normalize_base_url("not a URL").is_err());
-        assert!(normalize_base_url("https://user:password@example.test").is_err());
+async fn fetch_once(
+    client: &Client,
+    provider: &Provider,
+    auth: &AuthRecord,
+    endpoints: &Endpoints<'_>,
+) -> std::result::Result<AccountUsage, HttpError> {
+    match provider {
+        Provider::Codex => codex::fetch(client, auth, endpoints.codex).await,
+        Provider::Claude => claude::fetch(client, auth, endpoints.claude).await,
+        Provider::OpenRouter => openrouter::fetch(client, auth, endpoints.openrouter).await,
+        Provider::Antigravity => antigravity::fetch(client, auth, endpoints.antigravity).await,
+        Provider::Other(_) => Err(HttpError::InvalidPayload),
+    }
+}
+
+fn refresh_token(auth: &AuthRecord) -> Option<&str> {
+    auth.refresh_token.as_deref().filter(|token| !token.is_empty() && *token != "__remote__")
+}
+
+async fn refresh(
+    client: &Client,
+    provider: &Provider,
+    auth: &mut AuthRecord,
+    endpoints: &Endpoints<'_>,
+) -> Result<()> {
+    let token = refresh_token(auth)
+        .ok_or_else(|| eyre!("OAuth token needs refresh but no local refresh token is available"))?;
+    let request = match provider {
+        Provider::Codex => client.post(endpoints.codex_token).form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", token),
+            ("client_id", auth.default_oauth_client_id()),
+        ]),
+        Provider::Claude => client.post(endpoints.claude_token)
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header(USER_AGENT, "anthropic-sdk-typescript/0.112.1 userOAuthProvider")
+            .json(&json!({
+                "grant_type": "refresh_token", "refresh_token": token,
+                "client_id": CLAUDE_CLIENT_ID,
+            })),
+        Provider::Antigravity => client.post(endpoints.antigravity_token).form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", token),
+            ("client_id", ANTIGRAVITY_CLIENT_ID),
+            ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
+        ]),
+        Provider::OpenRouter | Provider::Other(_) => return Err(eyre!("unsupported OAuth refresh provider")),
+    };
+    let payload = request_json(request).await.map_err(|error| eyre!("OAuth refresh: {error}"))?;
+    let access = text(&payload, "access_token")
+        .filter(|value| *value != "__remote__")
+        .ok_or_else(|| eyre!("OAuth refresh returned no usable access token"))?;
+    if *provider == Provider::Codex {
+        apply_refresh_payload(auth, &payload)
+            .map_err(|_| eyre!("OAuth refresh returned incomplete credentials"))?;
+    } else {
+        auth.access_token = access.to_owned();
+        if let Some(token) = text(&payload, "refresh_token").filter(|value| *value != "__remote__") {
+            auth.refresh_token = Some(token.to_owned());
+        }
+        if let Some(token) = text(&payload, "id_token") {
+            auth.id_token = Some(token.to_owned());
+        }
+    }
+    // Do not retain the expired timestamp when a refresh omits its lifetime.
+    auth.expires_at = payload.get("expires_in").and_then(integer)
+        .filter(|seconds| *seconds >= 0)
+        .and_then(|seconds| now_ms()?.checked_add(seconds.checked_mul(1_000)?));
+    Ok(())
+}
+
+#[derive(Debug)]
+enum HttpError {
+    Status(StatusCode),
+    Timeout,
+    Transport,
+    InvalidCredential,
+    Oversized,
+    InvalidJson,
+    InvalidPayload,
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Status(status) => write!(formatter, "endpoint returned HTTP {}", status.as_u16()),
+            Self::Timeout => formatter.write_str("request timed out"),
+            Self::Transport => formatter.write_str("could not contact endpoint"),
+            Self::InvalidCredential => formatter.write_str("credential cannot be used as an HTTP header"),
+            Self::Oversized => formatter.write_str("response exceeded the size limit"),
+            Self::InvalidJson => formatter.write_str("endpoint returned invalid JSON"),
+            Self::InvalidPayload => formatter.write_str("endpoint did not report recognized usage data"),
+        }
+    }
+}
+
+fn transport_error(error: &reqwest::Error) -> HttpError {
+    if error.is_timeout() { HttpError::Timeout } else { HttpError::Transport }
+}
+
+fn authorized(request: RequestBuilder, auth: &AuthRecord, user_agent: &'static str)
+    -> std::result::Result<RequestBuilder, HttpError>
+{
+    let mut bearer = HeaderValue::from_str(&format!("Bearer {}", auth.access_token))
+        .map_err(|_| HttpError::InvalidCredential)?;
+    bearer.set_sensitive(true);
+    Ok(request.header(AUTHORIZATION, bearer)
+        .header(ACCEPT, "application/json").header(USER_AGENT, user_agent))
+}
+
+async fn request_json(request: RequestBuilder) -> std::result::Result<Value, HttpError> {
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        let mut response = request.timeout(REQUEST_TIMEOUT).send().await
+            .map_err(|error| transport_error(&error))?;
+        if !response.status().is_success() {
+            return Err(HttpError::Status(response.status()));
+        }
+        if response.content_length().is_some_and(|length| length > 1_048_576) {
+            return Err(HttpError::Oversized);
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| transport_error(&error))? {
+            if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                return Err(HttpError::Oversized);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| HttpError::InvalidJson)
+    }).await.map_err(|_| HttpError::Timeout)?
+}
+
+fn now_ms() -> Option<i64> {
+    now_millis().and_then(millis)
+}
+
+fn millis(value: Millis) -> Option<i64> {
+    i64::try_from(value.get()).ok()
+}
+
+fn timestamp(value: &Value) -> Option<i64> {
+    parse_timestamp_to_ms(value).and_then(millis)
+}
+
+fn number(value: &Value) -> Option<f64> {
+    value.as_f64().or_else(|| value.as_str()?.parse().ok()).filter(|number| number.is_finite())
+}
+
+fn nonnegative(value: &Value) -> Option<f64> {
+    number(value).filter(|number| *number >= 0.0)
+}
+
+fn integer(value: &Value) -> Option<i64> {
+    value.as_i64().or_else(|| value.as_str()?.parse().ok())
+}
+
+fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key)?.as_str().filter(|text| !text.trim().is_empty())
+}
+
+fn percent_metric(name: String, percent: Option<f64>, resets_at: Option<i64>) -> UsageMetric {
+    let percent = percent.filter(|number| number.is_finite()).map(|number| number.clamp(0.0, 100.0));
+    UsageMetric {
+        name,
+        used_percent: percent,
+        used: percent,
+        limit: percent.map(|_| 100.0),
+        unit: Some("percent".to_owned()),
+        resets_at,
+    }
+}
+
+fn spending_metric(name: String, used: Option<f64>, limit: Option<f64>, unit: &str) -> UsageMetric {
+    UsageMetric {
+        name,
+        used_percent: used.zip(limit).filter(|(_, limit)| *limit > 0.0)
+            .map(|(used, limit)| used / limit * 100.0).filter(|value| value.is_finite()),
+        used,
+        limit,
+        unit: Some(unit.to_owned()),
+        resets_at: None,
     }
 }
