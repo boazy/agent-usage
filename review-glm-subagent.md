@@ -1,4 +1,6 @@
-# Code Review: codex-usage CLI
+# Code Review: agent-usage CLI
+ 
+> Historical review of the predecessor `codex-usage` implementation; retained package-name references below describe that archived code.
 
 **Scope.** `src/main.rs` (2,021 lines, single file) and `Cargo.toml`, reviewed read-only. The repo contains only `Cargo.toml`, `Cargo.lock`, `.gitignore`, `src/main.rs` (plus an empty `src/bin/`): no README, LICENSE, CI, rustfmt/clippy config, and no `[lints]` section in `Cargo.toml`. Findings cite `src/main.rs:<line>`. Auth material (tokens, JWTs, the built-in OAuth client-id constant at main.rs:319-323) is referenced structurally only — no credential content is quoted anywhere in this report.
 

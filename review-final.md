@@ -1,4 +1,4 @@
-# Final merged review: codex-usage CLI
+# Final merged review: agent-usage CLI
 
 Two independent read-only reviews of `src/main.rs` (~2,021 lines) and `Cargo.toml`:
 

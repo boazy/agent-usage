@@ -11,7 +11,7 @@ const DEFAULT_THEME_NAME: &str = "default";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "codex-usage",
+    name = "agent-usage",
     version,
     about = "Show Codex usage details from ~/.codex/auth.json"
 )]
@@ -49,7 +49,7 @@ pub(crate) fn resolve_theme(cli: &Cli) -> Result<Theme> {
 }
 
 fn config_file_path() -> Option<PathBuf> {
-    AppDirs::new(Some("codex-usage"), true)
+    AppDirs::new(Some("agent-usage"), true)
         .map(|directories| directories.config_dir.join("config.toml"))
 }
 
@@ -64,7 +64,7 @@ fn resolve_theme_name(cli: &Cli) -> Result<String> {
     if let Some(config_path) = config_file_path().filter(|path| path.exists()) {
         builder = builder.add_source(ConfigFile::from(config_path));
     }
-    builder = builder.add_source(Environment::with_prefix("CODEX_USAGE"));
+    builder = builder.add_source(Environment::with_prefix("AGENT_USAGE"));
     builder
         .build()
         .wrap_err("failed to load theme configuration")?

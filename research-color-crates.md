@@ -1,4 +1,4 @@
-# Rust Terminal-Styling Crates for codex-usage (research as of 2026-09-05)
+# Rust Terminal-Styling Crates for agent-usage (research as of 2026-09-05)
 
 **Use case:** CLI app printing styled ANSI to stdout, then exiting; possible later ratatui adoption.
 **Key question:** which styling API survives a ratatui migration instead of becoming a dead end?

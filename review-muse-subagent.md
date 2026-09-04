@@ -1,4 +1,6 @@
-# Code review: codex-usage CLI (`src/main.rs`, ~2021 lines)
+# Code Review: agent-usage CLI (`src/main.rs`, ~2021 lines)
+
+> Historical review of the predecessor `codex-usage` implementation; retained package-name references below describe that archived code.
 
 Independent review. Scope: `src/main.rs`, `Cargo.toml`, `.gitignore` only. No files modified, no binary executed, no network calls. All line references are `src/main.rs:<line>` unless noted. No secrets encountered (only structural references to token fields); none quoted below.
 

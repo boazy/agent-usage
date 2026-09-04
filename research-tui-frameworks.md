@@ -1,4 +1,4 @@
-# Rust TUI Frameworks for codex-usage (2026 survey)
+# Rust TUI Frameworks for agent-usage (2026 survey)
 
 Research date: 2026-09-05. All versions/dates pulled live from the crates.io registry API, docs.rs, and the GitHub API. External research only — no repo reads.
 
