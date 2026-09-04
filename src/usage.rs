@@ -165,30 +165,34 @@ fn collect_rate_limit_items(
 }
 
 pub(crate) fn collect_banked_resets(payload: &ParsedUsage) -> Vec<BankReset> {
-    match &payload.reset_credits {
-        Some(credits) => credits
-            .iter()
-            .map(|credit| BankReset {
-                source: credit
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Reset credit".to_owned()),
-                expires_at: credit.expires_at,
-                count: None,
-            })
-            .collect(),
-        None => payload
-            .reset_credits_available
-            .filter(|count| *count > 0)
-            .map(|count| {
-                vec![BankReset {
-                    source: "Reset credits available".to_owned(),
-                    expires_at: None,
-                    count: Some(count),
-                }]
-            })
-            .unwrap_or_default(),
-    }
+    payload.reset_credits.as_ref().map_or_else(
+        || {
+            payload
+                .reset_credits_available
+                .filter(|count| *count > 0)
+                .map(|count| {
+                    vec![BankReset {
+                        source: "Reset credits available".to_owned(),
+                        expires_at: None,
+                        count: Some(count),
+                    }]
+                })
+                .unwrap_or_default()
+        },
+        |credits| {
+            credits
+                .iter()
+                .map(|credit| BankReset {
+                    source: credit
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Reset credit".to_owned()),
+                    expires_at: credit.expires_at,
+                    count: None,
+                })
+                .collect()
+        },
+    )
 }
 
 fn build_usage_item(
