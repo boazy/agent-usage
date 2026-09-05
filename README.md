@@ -19,9 +19,11 @@ cargo build --release
 ./target/release/agent-usage --config ./config.toml --theme solarized-dark
 ```
 
-Reports fit as many 44-column panes as the output width allows, then continue
-onto additional rows. Each pane has a one-cell inset around its content;
-wrapping and scrolling include that padding. Narrow terminals use one pane.
+Reports and the dashboard fit as many columns of at least 44 characters as the
+width allows. Panes go into the shortest available column, so shorter boxes do
+not leave gaps beneath taller neighbors. Each pane has a one-cell inset around
+its content; wrapping and scrolling include that padding. Narrow terminals use
+one column.
 Piped reports default to 100 columns, contain no cursor-drawing commands, and
 have no terminal-height limit. `--no-progress` suppresses progress messages; the
 report gauges remain visible.
@@ -223,6 +225,7 @@ absent from an earlier source.
 | Page Up / Page Down | Scroll by a screen or picker page |
 | Home / End | Jump to the first or last row/item |
 | `r` | Refresh only account panes intersecting the current screen |
+| `[` / `]` | Scroll the pending-provider list backward / forward |
 | Backspace / Ctrl-U | Remove a character / clear the search in a picker |
 | `q`, Escape, Ctrl-C | Quit; `q` is literal search text in the live filter and all pickers |
 
@@ -235,11 +238,25 @@ selection and text filter. Escape and Ctrl-C quit rather than dismissing a
 picker.
 
 An empty live filter restores the unfiltered set. Choosing a provider or account
-clears the previous text filter. Resizing recomputes pane widths and visibility.
-Initial usage fetching runs in the background, so loading panes and controls
-remain responsive. Later automatic refreshes use the visible set at
-`refresh_seconds` intervals. Off-screen snapshots remain unchanged until
-refreshed.
+clears the previous text filter. Resizing and filtering recompute pane placement
+and visibility.
+
+Initial usage fetching runs in the background. Each account appears as soon as
+its fetch completes, and the boxes repack as details arrive. Accounts that have
+not completed their first fetch have no placeholder pane. A failed account gets
+an error pane named for its account and provider; other accounts from that
+provider keep their results.
+
+While requests are pending, a loading box stays at the bottom right. It lists
+each pending provider once, even if several accounts are loading. A provider
+leaves the list only when all its pending accounts finish, including failures.
+Changing filters does not hide pending work. The layout reserves space for this
+box so it does not cover account data. Long lists stay within the viewport; use
+`[` and `]` to scroll them.
+
+Existing results remain visible during refresh. Later automatic refreshes use
+the visible set at `refresh_seconds` intervals. Off-screen snapshots remain
+unchanged until refreshed.
 
 Quitting restores the screen immediately and stops queued fetches. Already
 active requests finish within the configured timeout, followed by bounded
@@ -294,9 +311,9 @@ table and use conditional row updates. Older stores use advisory locks and
 conditional updates without creating a new lease schema. JSON writes use
 cooperative locks, a final content/inode check, a private temporary file, atomic
 replacement, and fsync. A separate program that ignores the JSON locks can still
-write in the final check-to-replacement interval; this limitation is reported
-during discovery. Older OMP versions without shared leases also cannot prevent
-simultaneous provider-side grant rotation by another program.
+write in the final check-to-replacement interval. Older OMP versions without
+shared leases also cannot prevent simultaneous provider-side grant rotation by
+another program.
 
 Broker refresh sentinels are never sent to OAuth endpoints. Refresh those grants
 through their owning tool. The dashboard does not add a credential broker,

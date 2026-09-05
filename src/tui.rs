@@ -1,6 +1,7 @@
 use crate::dashboard::{AccountSnapshot, Dashboard};
 use crate::render::{
-    account_label, color_enabled, layout_panes, short_account_id, style, PlacedPane,
+    account_label, clean, color_enabled, layout_panes, short_account_id, style, PlacedPane,
+    MIN_PANE_WIDTH,
 };
 use crate::theme::{Theme, BUILTIN_THEMES};
 use crossterm::cursor::{Hide, Show};
@@ -17,6 +18,7 @@ use std::collections::BTreeSet;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 #[cfg(test)]
@@ -48,6 +50,11 @@ struct Choice {
 
 pub(crate) struct DashboardView {
     snapshots: Vec<AccountSnapshot>,
+    completed: Vec<bool>,
+    pending: BTreeSet<usize>,
+    refresh_completed: usize,
+    refresh_failures: usize,
+    loading_scroll: usize,
     filter: String,
     provider: Option<String>,
     account: Option<String>,
@@ -79,6 +86,11 @@ impl DashboardView {
             .collect();
         Self {
             snapshots,
+            completed: vec![false; dashboard.accounts().len()],
+            pending: BTreeSet::new(),
+            refresh_completed: 0,
+            refresh_failures: 0,
+            loading_scroll: 0,
             filter: String::new(),
             provider: None,
             account: None,
@@ -107,15 +119,54 @@ impl DashboardView {
             .collect()
     }
 
-    fn panes(&self, width: u16) -> Vec<PlacedPane> {
+    fn panes(&self, width: u16, reserved: Option<Rect>) -> Vec<PlacedPane> {
+        let matching = self.indices();
+        let details = matching.len() == 1
+            && (self.account.is_some()
+                || !self.filter.trim().is_empty()
+                || self.provider.is_some());
+        let ready: Vec<_> = matching
+            .into_iter()
+            .filter(|&index| self.completed[index])
+            .collect();
         layout_panes(
             &self.snapshots,
-            &self.indices(),
+            &ready,
             width,
             self.theme,
             self.color,
-            self.account.is_some() || !self.filter.trim().is_empty() || self.provider.is_some(),
+            details,
+            reserved,
         )
+    }
+
+    fn loading_providers(&self) -> Vec<String> {
+        self.pending
+            .iter()
+            .map(|&index| clean(&self.snapshots[index].account.provider.to_string()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn loading_area(content: Rect, providers: &[String]) -> Option<Rect> {
+        if providers.is_empty() || content.width == 0 || content.height == 0 {
+            return None;
+        }
+        let columns = (content.width / MIN_PANE_WIDTH).max(1);
+        let width = content.width / columns;
+        // Keep a useful data viewport even on a single narrow column. Long provider
+        // lists page inside this footprint instead of consuming the entire screen.
+        let height = u16::try_from(providers.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(4)
+            .min((content.height / 2).max(1));
+        Some(Rect::new(
+            content.width - width,
+            content.height - height,
+            width,
+            height,
+        ))
     }
 
     fn content_area(area: Rect) -> Rect {
@@ -127,42 +178,59 @@ impl DashboardView {
         )
     }
 
-    fn clamp_scroll(&mut self, panes: &[PlacedPane], height: u16) {
-        let total = panes
+    fn clamp_scroll(&mut self, panes: &[PlacedPane], height: u16, reserved: Option<Rect>) {
+        let maximum = panes
             .iter()
-            .map(|pane| pane.y + usize::from(pane.height))
+            .map(|pane| {
+                (pane.y + usize::from(pane.height))
+                    .saturating_sub(usize::from(pane_viewport_height(pane, height, reserved)))
+            })
             .max()
             .unwrap_or(0);
-        self.scroll = self.scroll.min(total.saturating_sub(usize::from(height)));
+        self.scroll = self.scroll.min(maximum);
     }
 
     fn visible_ids(&mut self, area: Rect) -> Vec<String> {
         let content = Self::content_area(area);
-        let panes = self.panes(content.width);
-        self.clamp_scroll(&panes, content.height);
+        let reserved = Self::loading_area(content, &self.loading_providers());
+        let panes = self.panes(content.width, reserved);
+        self.clamp_scroll(&panes, content.height, reserved);
         panes
             .iter()
-            .filter(|pane| intersects(pane, self.scroll, content.height))
+            .filter(|pane| {
+                intersects(
+                    pane,
+                    self.scroll,
+                    pane_viewport_height(pane, content.height, reserved),
+                )
+            })
             .map(|pane| self.snapshots[pane.index].account.id.clone())
             .collect()
     }
 
-    fn merge(&mut self, updates: Vec<AccountSnapshot>) {
-        let count = updates.len();
-        let failures = updates
-            .iter()
-            .filter(|snapshot| snapshot.error.is_some())
-            .count();
-        for update in updates {
-            if let Some(snapshot) = self
-                .snapshots
-                .iter_mut()
-                .find(|snapshot| snapshot.account.id == update.account.id)
-            {
-                *snapshot = update;
-            }
+    fn complete(&mut self, index: usize, update: AccountSnapshot) {
+        if !self.pending.remove(&index) {
+            return;
         }
-        self.status = format!("Updated {count} account(s); {failures} unavailable");
+        self.refresh_completed += 1;
+        self.refresh_failures += usize::from(update.error.is_some());
+        self.snapshots[index] = update;
+        self.completed[index] = true;
+        self.status = format!(
+            "Updated {} account(s); {} unavailable; {} pending",
+            self.refresh_completed,
+            self.refresh_failures,
+            self.pending.len()
+        );
+    }
+
+    fn fail_pending(&mut self, message: &str) {
+        while let Some(&index) = self.pending.first() {
+            let mut snapshot = self.snapshots[index].clone();
+            snapshot.usage = None;
+            snapshot.error = Some(message.to_owned());
+            self.complete(index, snapshot);
+        }
     }
 
     fn choices(&self, kind: PickerKind, query: &str) -> Vec<Choice> {
@@ -235,9 +303,11 @@ impl DashboardView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let providers = self.loading_providers();
         let content = Self::content_area(area);
-        let panes = self.panes(content.width);
-        self.clamp_scroll(&panes, content.height);
+        let reserved = Self::loading_area(content, &providers);
+        let panes = self.panes(content.width, reserved);
+        self.clamp_scroll(&panes, content.height, reserved);
         let heading = format!(
             "Agent usage · {} account(s) · theme {}",
             panes.len(),
@@ -247,6 +317,10 @@ impl DashboardView {
             Paragraph::new(heading).style(style(self.theme.title, self.color)),
             Rect::new(area.x, area.y, area.width, 1),
         );
+        if content.height == 0 && !providers.is_empty() {
+            self.draw_loading(frame, area, &providers);
+            return;
+        }
         if area.height == 1 {
             return;
         }
@@ -263,21 +337,21 @@ impl DashboardView {
         if area.height < 4 {
             return;
         }
-        if panes.is_empty() {
+        if panes.is_empty() && providers.is_empty() {
             frame.render_widget(
                 Paragraph::new("No matching accounts. Clear / filter or select All with p / a."),
                 content,
             );
         }
         for pane in &panes {
-            if !intersects(pane, self.scroll, content.height) {
+            let height = pane_viewport_height(pane, content.height, reserved);
+            if !intersects(pane, self.scroll, height) {
                 continue;
             }
             let mut buffer = Buffer::empty(Rect::new(0, 0, pane.width, pane.height));
             (&pane.pane).render(buffer.area, &mut buffer);
             let start = self.scroll.saturating_sub(pane.y);
-            let end =
-                usize::from(pane.height).min(self.scroll + usize::from(content.height) - pane.y);
+            let end = usize::from(pane.height).min(self.scroll + usize::from(height) - pane.y);
             for row in start..end {
                 let y = content.y + u16::try_from(pane.y + row - self.scroll).unwrap_or(0);
                 for x in 0..pane.width {
@@ -285,6 +359,18 @@ impl DashboardView {
                         buffer[(x, u16::try_from(row).unwrap_or(0))].clone();
                 }
             }
+        }
+        if let Some(reserved) = reserved {
+            self.draw_loading(
+                frame,
+                Rect::new(
+                    content.x + reserved.x,
+                    content.y + reserved.y,
+                    reserved.width,
+                    reserved.height,
+                ),
+                &providers,
+            );
         }
         let footer_y = area.bottom().saturating_sub(2);
         frame.render_widget(
@@ -294,13 +380,64 @@ impl DashboardView {
         let help = match self.mode {
             Mode::Filter => "Type filter (q is text) · Enter done · Esc/Ctrl-C quit",
             Mode::Picker { .. } => "Type to search (q is text) · arrows move · Enter select · Esc/Ctrl-C quit",
-            Mode::Browse => "/ filter · p providers · a accounts · t theme · arrows/PgUp/PgDn scroll · r visible refresh · q/Esc quit",
+            Mode::Browse => "/ filter · p/a/t pick · arrows/PgUp/PgDn scroll · [/] loading · r visible refresh · q/Esc quit",
         };
         frame.render_widget(
             Paragraph::new(help).style(style(self.theme.window, self.color)),
             Rect::new(area.x, footer_y.saturating_add(1), area.width, 1),
         );
         self.draw_picker(frame, area);
+    }
+
+    fn draw_loading(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, providers: &[String]) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let block = Block::default()
+            .borders(if area.height >= 3 {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            })
+            .padding(if area.height >= 5 {
+                Padding::uniform(1)
+            } else {
+                Padding::ZERO
+            })
+            .border_style(style(self.theme.active_border, self.color))
+            .title_style(style(self.theme.title, self.color));
+        let inner = block.inner(area);
+        let rows = usize::from(inner.height);
+        self.loading_scroll = self
+            .loading_scroll
+            .min(providers.len().saturating_sub(rows));
+        let title = if providers.len() > rows {
+            format!(
+                " Loading {}–{}/{} [ ] ",
+                self.loading_scroll + 1,
+                (self.loading_scroll + rows).min(providers.len()),
+                providers.len()
+            )
+        } else {
+            " Loading ".to_owned()
+        };
+        frame.render_widget(block.title(title), area);
+        let items: Vec<_> = providers
+            .iter()
+            .skip(self.loading_scroll)
+            .take(rows)
+            .map(|provider| {
+                if area.height < 3 {
+                    ListItem::new(format!("Loading: {provider}"))
+                } else {
+                    ListItem::new(provider.as_str())
+                }
+            })
+            .collect();
+        frame.render_widget(
+            List::new(items).style(style(self.theme.unknown, self.color)),
+            inner,
+        );
     }
 
     fn draw_picker(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -511,6 +648,8 @@ impl DashboardView {
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = usize::MAX,
+            KeyCode::Char(']') => self.loading_scroll = self.loading_scroll.saturating_add(1),
+            KeyCode::Char('[') => self.loading_scroll = self.loading_scroll.saturating_sub(1),
             KeyCode::Char('r') => return Action::Refresh(self.visible_ids(area)),
             _ => {}
         }
@@ -582,6 +721,15 @@ fn intersects(pane: &PlacedPane, scroll: usize, height: u16) -> bool {
         && pane.y + usize::from(pane.height) > scroll
 }
 
+fn pane_viewport_height(pane: &PlacedPane, height: u16, reserved: Option<Rect>) -> u16 {
+    if let Some(reserved) = reserved {
+        if pane.x < reserved.right() && pane.x.saturating_add(pane.width) > reserved.x {
+            return height.min(reserved.y);
+        }
+    }
+    height
+}
+
 struct TerminalSession;
 
 impl TerminalSession {
@@ -621,12 +769,13 @@ pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: Theme, refresh: Durati
     let mut terminal = ratatui::Terminal::new(backend)?;
     let mut view = DashboardView::new(&dashboard, theme);
     let mut jobs = JoinSet::new();
+    let (updates, mut completions) = mpsc::channel(32);
     let all_ids = dashboard
         .accounts()
         .iter()
         .map(|account| account.id.clone())
         .collect();
-    start_refresh(&mut jobs, &dashboard, all_ids, &mut view);
+    start_refresh(&mut jobs, &dashboard, all_ids, &mut view, &updates);
     let mut events = EventStream::new();
     let mut redraw = tokio::time::interval(Duration::from_secs(1));
     redraw.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -642,7 +791,7 @@ pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: Theme, refresh: Durati
                     let area = Rect::new(0, 0, size.width, size.height);
                     match view.key(key, area) {
                         Action::Quit => break,
-                        Action::Refresh(ids) => start_refresh(&mut jobs, &dashboard, ids, &mut view),
+                        Action::Refresh(ids) => start_refresh(&mut jobs, &dashboard, ids, &mut view, &updates),
                         Action::None => {}
                     }
                 }
@@ -650,16 +799,18 @@ pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: Theme, refresh: Durati
                 Some(Err(error)) => return Err(error).wrap_err("terminal event stream failed"),
                 None => break,
             },
-            result = jobs.join_next(), if !jobs.is_empty() => match result {
-                Some(Ok(snapshots)) => view.merge(snapshots),
-                Some(Err(_)) => "Refresh worker failed; press r to retry".clone_into(&mut view.status),
-                None => {}
+            Some((index, snapshot)) = completions.recv() => view.complete(index, snapshot),
+            result = jobs.join_next(), if !jobs.is_empty() => {
+                drain_completions(&mut completions, &mut view);
+                if result.is_some() {
+                    view.fail_pending("Refresh worker failed; press r to retry");
+                }
             },
             _ = automatic.tick() => {
                 if jobs.is_empty() {
                     let size = terminal.size()?;
                     let ids = view.visible_ids(Rect::new(0, 0, size.width, size.height));
-                    start_refresh(&mut jobs, &dashboard, ids, &mut view);
+                    start_refresh(&mut jobs, &dashboard, ids, &mut view, &updates);
                 }
             },
             _ = redraw.tick() => {}
@@ -671,25 +822,63 @@ pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: Theme, refresh: Durati
     // Stop queued work but preserve in-flight token rotation/persistence. Restore
     // the screen immediately; only the bounded active requests finish afterward.
     drop(session);
+    // Closing the UI receiver releases a blocked progress send, not the fetch/save.
+    completions.close();
     while jobs.join_next().await.is_some() {}
+    drain_completions(&mut completions, &mut view);
+    view.fail_pending("Refresh canceled during shutdown");
     result
 }
 
 fn start_refresh(
-    jobs: &mut JoinSet<Vec<AccountSnapshot>>,
+    jobs: &mut JoinSet<()>,
     dashboard: &Arc<Dashboard>,
     ids: Vec<String>,
     view: &mut DashboardView,
+    updates: &mpsc::Sender<(usize, AccountSnapshot)>,
 ) {
     if !jobs.is_empty() {
         "Refresh already in progress".clone_into(&mut view.status);
         return;
     }
-    if ids.is_empty() {
+    let ids: BTreeSet<_> = ids.into_iter().collect();
+    let selected: BTreeSet<_> = view
+        .snapshots
+        .iter()
+        .enumerate()
+        .filter(|(_, snapshot)| ids.contains(&snapshot.account.id))
+        .map(|(index, _)| index)
+        .collect();
+    if selected.is_empty() {
         "No visible accounts to refresh".clone_into(&mut view.status);
         return;
     }
+    let ids: Vec<_> = selected
+        .iter()
+        .map(|&index| view.snapshots[index].account.id.clone())
+        .collect();
+    view.pending = selected;
+    view.refresh_completed = 0;
+    view.refresh_failures = 0;
+    view.loading_scroll = 0;
     view.status = format!("Refreshing {} account(s)…", ids.len());
     let dashboard = Arc::clone(dashboard);
-    jobs.spawn(async move { dashboard.refresh(&ids).await });
+    let updates = updates.clone();
+    jobs.spawn(async move {
+        let stream = dashboard.refresh_stream(&ids);
+        futures_util::pin_mut!(stream);
+        while let Some(completion) = stream.next().await {
+            // A closed receiver must never cancel a credential rotation or save.
+            let _ = updates.send(completion).await;
+        }
+    });
+}
+
+fn drain_completions(
+    completions: &mut mpsc::Receiver<(usize, AccountSnapshot)>,
+    view: &mut DashboardView,
+) {
+    while let Ok((index, snapshot)) = completions.try_recv() {
+        view.complete(index, snapshot);
+    }
 }

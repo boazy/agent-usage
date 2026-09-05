@@ -12,6 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -490,39 +491,60 @@ pub(crate) fn layout_panes(
     theme: Theme,
     color: bool,
     show_account_id: bool,
+    reserved: Option<Rect>,
 ) -> Vec<PlacedPane> {
     let width = width.max(1);
     let columns = usize::from((width / MIN_PANE_WIDTH).max(1));
     let column_count = u16::try_from(columns).unwrap_or(1);
     let base_width = width / column_count;
     let extra = width % column_count;
-    let mut result = Vec::with_capacity(indices.len());
-    let mut y = 0;
-    for row in indices.chunks(columns) {
-        let mut x = 0;
-        let mut row_height = 0;
-        for (column, &index) in row.iter().enumerate() {
-            let pane_width = base_width + u16::from(column < usize::from(extra));
-            let pane = AccountPane::new(
-                &snapshots[index],
-                pane_width,
-                theme,
-                color,
-                show_account_id && indices.len() == 1,
-            );
-            let height = pane.height();
-            row_height = row_height.max(height);
-            result.push(PlacedPane {
-                index,
-                x,
-                y,
-                width: pane_width,
-                height,
-                pane,
-            });
-            x += pane_width;
+    let pane_widths: Vec<u16> = (0..columns)
+        .map(|column| base_width + u16::from(column < usize::from(extra)))
+        .collect();
+    let pane_x: Vec<u16> = pane_widths
+        .iter()
+        .scan(0, |x, pane_width| {
+            let result = *x;
+            *x += *pane_width;
+            Some(result)
+        })
+        .collect();
+    let mut column_heights = vec![0usize; columns];
+    let mut scores = vec![0usize; columns];
+    if let Some(reserved) = reserved {
+        for column in 0..columns {
+            let right = pane_x[column] + pane_widths[column];
+            if pane_x[column] < reserved.right() && right > reserved.x {
+                scores[column] = usize::from(reserved.height);
+            }
         }
-        y += usize::from(row_height);
+    }
+    let mut result = Vec::with_capacity(indices.len());
+    for &index in indices {
+        let column = scores
+            .iter()
+            .enumerate()
+            .min_by_key(|&(column, score)| (*score, column))
+            .map_or(0, |(column, _)| column);
+        let pane = AccountPane::new(
+            &snapshots[index],
+            pane_widths[column],
+            theme,
+            color,
+            show_account_id && indices.len() == 1,
+        );
+        let height = pane.height();
+        let y = column_heights[column];
+        column_heights[column] = y.saturating_add(usize::from(height));
+        scores[column] = scores[column].saturating_add(usize::from(height));
+        result.push(PlacedPane {
+            index,
+            x: pane_x[column],
+            y,
+            width: pane_widths[column],
+            height,
+            pane,
+        });
     }
     result
 }
@@ -551,7 +573,7 @@ pub(crate) fn render_report(
 ) -> io::Result<()> {
     let color = color_enabled();
     let indices: Vec<_> = (0..snapshots.len()).collect();
-    let panes = layout_panes(snapshots, &indices, width, theme, color, false);
+    let panes = layout_panes(snapshots, &indices, width, theme, color, false, None);
     let mut output = anstream::AutoStream::auto(io::stdout().lock());
     if panes.is_empty() {
         return writeln!(
@@ -559,27 +581,81 @@ pub(crate) fn render_report(
             "No accounts found. Check configured credential sources and exclusions."
         );
     }
-    // Stream one grid row at a time: the complete report has no terminal-height
-    // limit and never enters alternate-screen/cursor-drawing mode.
-    let mut cursor = 0;
-    while cursor < panes.len() {
-        let y = panes[cursor].y;
-        let end = cursor
-            + panes[cursor..]
-                .iter()
-                .take_while(|pane| pane.y == y)
-                .count();
-        let row = &panes[cursor..end];
-        let height = row.iter().map(|pane| pane.height).max().unwrap_or(1);
-        let area = Rect::new(0, 0, width.max(1), height);
+    write_panes(&panes, width, &mut output, color)?;
+    output.flush()
+}
+
+fn write_panes<W: Write>(
+    panes: &[PlacedPane],
+    width: u16,
+    mut output: W,
+    color: bool,
+) -> io::Result<()> {
+    let mut boundaries = BTreeSet::new();
+    boundaries.insert(0usize);
+    for pane in panes {
+        boundaries.insert(pane.y);
+        boundaries.insert(pane.y.saturating_add(usize::from(pane.height)));
+    }
+    let mut columns: Vec<Vec<usize>> = Vec::new();
+    let mut starts = Vec::new();
+    for (pane_index, pane) in panes.iter().enumerate() {
+        if let Some(column) = starts.iter().position(|&x| x == pane.x) {
+            columns[column].push(pane_index);
+        } else {
+            starts.push(pane.x);
+            columns.push(vec![pane_index]);
+        }
+    }
+    let mut cursors = vec![0usize; columns.len()];
+    let mut buffers: Vec<Option<Buffer>> = (0..columns.len()).map(|_| None).collect();
+    let boundaries: Vec<_> = boundaries.into_iter().collect();
+    for pair in boundaries.windows(2) {
+        let band_start = pair[0];
+        let band_height = pair[1].saturating_sub(band_start);
+        if band_height == 0 {
+            continue;
+        }
+        let band_height = u16::try_from(band_height)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "pane band exceeds u16"))?;
+        let area = Rect::new(0, 0, width.max(1), band_height);
         let mut buffer = Buffer::empty(area);
-        for pane in row {
-            (&pane.pane).render(Rect::new(pane.x, 0, pane.width, pane.height), &mut buffer);
+        for column in 0..columns.len() {
+            while cursors[column] < columns[column].len() {
+                let pane = &panes[columns[column][cursors[column]]];
+                if pane.y.saturating_add(usize::from(pane.height)) <= band_start {
+                    cursors[column] += 1;
+                    buffers[column] = None;
+                } else {
+                    break;
+                }
+            }
+            let Some(&pane_index) = columns[column].get(cursors[column]) else {
+                continue;
+            };
+            let pane = &panes[pane_index];
+            if pane.y > band_start || pane.y >= band_start + usize::from(band_height) {
+                continue;
+            }
+            let pane_buffer = buffers[column].get_or_insert_with(|| {
+                let mut pane_buffer = Buffer::empty(Rect::new(0, 0, pane.width, pane.height));
+                (&pane.pane).render(pane_buffer.area, &mut pane_buffer);
+                pane_buffer
+            });
+            let row_start = band_start.saturating_sub(pane.y);
+            let row_end =
+                (band_start + usize::from(band_height) - pane.y).min(usize::from(pane.height));
+            for row in row_start..row_end {
+                let dst_y = u16::try_from(pane.y + row - band_start).unwrap_or(0);
+                for x in 0..pane.width {
+                    buffer[(pane.x + x, dst_y)] =
+                        pane_buffer[(x, u16::try_from(row).unwrap_or(0))].clone();
+                }
+            }
         }
         write_buffer(&buffer, area, &mut output, color)?;
-        cursor = end;
     }
-    output.flush()
+    Ok(())
 }
 
 pub(crate) fn write_buffer<W: Write>(
@@ -693,7 +769,7 @@ fn ansi_color(color: Color) -> Option<anstyle::Color> {
     })
 }
 
-fn clean(value: &str) -> String {
+pub(crate) fn clean(value: &str) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
@@ -996,6 +1072,138 @@ mod tests {
                 assert_eq!(buffer[(width - 2, row)].symbol(), " ");
             }
         }
+        Ok(())
+    }
+    #[test]
+    fn masonry_packing_has_bounds_nonoverlap_and_beats_equal_row_height() {
+        let mut snapshots = Vec::new();
+        for warning_count in [0, 20, 0, 0] {
+            let mut account = snapshot();
+            account.warnings = (0..warning_count)
+                .map(|index| format!("warning-{index}"))
+                .collect();
+            snapshots.push(account);
+        }
+        let width = 88;
+        let indices: Vec<_> = (0..snapshots.len()).collect();
+        let panes = super::layout_panes(
+            &snapshots,
+            &indices,
+            width,
+            crate::theme::BUILTIN_THEMES[0],
+            false,
+            false,
+            None,
+        );
+        for left in &panes {
+            assert!(left.x + left.width <= width);
+            for right in &panes {
+                if std::ptr::eq(left, right) {
+                    continue;
+                }
+                let x_overlap = left.x < right.x + right.width && right.x < left.x + left.width;
+                let y_overlap = left.y < right.y + usize::from(right.height)
+                    && right.y < left.y + usize::from(left.height);
+                assert!(!(x_overlap && y_overlap));
+            }
+        }
+        let packed_height = panes
+            .iter()
+            .map(|pane| pane.y + usize::from(pane.height))
+            .max()
+            .unwrap_or(0);
+        let row_height = panes
+            .chunks(2)
+            .map(|row| {
+                row.iter()
+                    .map(|pane| usize::from(pane.height))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum::<usize>();
+        assert!(packed_height < row_height);
+    }
+
+    #[test]
+    fn reserved_columns_seed_masonry_score_without_moving_pane_coordinates() {
+        let snapshots = vec![snapshot(), snapshot()];
+        let indices = vec![0, 1];
+        let baseline = super::layout_panes(
+            &snapshots,
+            &indices,
+            88,
+            crate::theme::BUILTIN_THEMES[0],
+            false,
+            false,
+            None,
+        );
+        let reserved = super::layout_panes(
+            &snapshots,
+            &indices,
+            88,
+            crate::theme::BUILTIN_THEMES[0],
+            false,
+            false,
+            Some(Rect::new(44, 0, 44, 100)),
+        );
+        assert_eq!(reserved[0].x, 0);
+        assert_eq!(reserved[0].y, 0);
+        assert_eq!(baseline[1].x, 44);
+        assert_eq!(reserved[1].x, 0);
+        assert_ne!(reserved[1].x, baseline[1].x);
+    }
+    #[test]
+    fn masonry_report_serializes_interleaved_panes_once_without_cursor_controls() -> Result<()> {
+        let mut snapshots = Vec::new();
+        for (index, warning_count) in [20, 0, 8, 1].into_iter().enumerate() {
+            let mut account = snapshot();
+            account.account.label = if index == 0 {
+                "界-A".to_owned()
+            } else {
+                format!("account-{index}")
+            };
+            account.warnings = (0..warning_count)
+                .map(|warning| format!("unique-{index}-{warning}!"))
+                .collect();
+            snapshots.push(account);
+        }
+        let indices: Vec<_> = (0..snapshots.len()).collect();
+        let panes = super::layout_panes(
+            &snapshots,
+            &indices,
+            88,
+            crate::theme::BUILTIN_THEMES[0],
+            false,
+            false,
+            None,
+        );
+        let mut output = Vec::new();
+        super::write_panes(&panes, 88, &mut output, false)?;
+        let text = String::from_utf8(output)?;
+        assert!(!text.contains('\u{1b}'));
+        assert_eq!(text.matches("界-A").count(), 1);
+        for index in 1..snapshots.len() {
+            assert_eq!(text.matches(&format!("account-{index}")).count(), 1);
+        }
+        for marker in ["unique-0-1!", "unique-0-2!", "unique-2-7!", "unique-3-0!"] {
+            assert_eq!(
+                text.matches(marker).count(),
+                1,
+                "missing or duplicated {marker}"
+            );
+        }
+        let mut colored = Vec::new();
+        super::write_panes(&panes, 88, &mut colored, true)?;
+        let colored = String::from_utf8(colored)?;
+        for marker in ["unique-0-1!", "unique-2-7!", "unique-3-0!"] {
+            assert_eq!(colored.matches(marker).count(), 1, "colored {marker}");
+        }
+        let expected_height = panes
+            .iter()
+            .map(|pane| pane.y + usize::from(pane.height))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(text.lines().count(), expected_height);
         Ok(())
     }
 }

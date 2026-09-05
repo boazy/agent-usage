@@ -29,6 +29,7 @@ const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 // not account secrets. Google requires both on the refresh-token grant.
 const ANTIGRAVITY_CLIENT_ID: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+// Not a real client secret (public secret)
 const ANTIGRAVITY_CLIENT_SECRET: &str = "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";
 const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.257 (external, cli)";
 const ANTIGRAVITY_USER_AGENT: &str =

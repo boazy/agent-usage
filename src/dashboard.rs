@@ -6,7 +6,7 @@ use crate::sources::{
 };
 use crate::time::Millis;
 use eyre::{Result, WrapErr};
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -432,9 +432,13 @@ impl Dashboard {
         &self.warnings
     }
 
-    /// An empty visible set fetches nothing. Calls can run on an Arc in a UI task.
-    /// A global semaphore bounds concurrent calls, including overlapping refreshes.
-    pub(crate) async fn refresh(&self, visible_ids: &[String]) -> Vec<AccountSnapshot> {
+    /// Yield each selected account as soon as its fetch and credential save settle.
+    /// An empty set fetches nothing; the global semaphore also bounds overlapping calls.
+    /// Consumers must drain this stream rather than drop in-flight token rotations.
+    pub(crate) fn refresh_stream<'a>(
+        &'a self,
+        visible_ids: &[String],
+    ) -> impl Stream<Item = (usize, AccountSnapshot)> + 'a {
         let visible: HashSet<&str> = visible_ids.iter().map(String::as_str).collect();
         let indices: Vec<usize> = self
             .accounts
@@ -445,11 +449,13 @@ impl Dashboard {
             .collect();
         let work = indices
             .into_iter()
-            .map(|index| async move { (index, self.refresh_one(index).await) });
-        let mut snapshots: Vec<_> = stream::iter(work)
-            .buffer_unordered(self.states.len().clamp(1, 32))
-            .collect()
-            .await;
+            .map(move |index| async move { (index, self.refresh_one(index).await) });
+        stream::iter(work).buffer_unordered(self.states.len().clamp(1, 32))
+    }
+
+    /// Static reports collect the same completion stream in discovery order.
+    pub(crate) async fn refresh(&self, visible_ids: &[String]) -> Vec<AccountSnapshot> {
+        let mut snapshots: Vec<_> = self.refresh_stream(visible_ids).collect().await;
         snapshots.sort_unstable_by_key(|(index, _)| *index);
         snapshots
             .into_iter()

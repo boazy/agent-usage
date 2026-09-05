@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
-const JSON_RACE_WARNING: &str = "JSON refresh persistence uses advisory locks and a final conflict check; a foreign writer that ignores locks can still race the atomic replacement";
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct SourceDiscovery {
@@ -292,13 +291,6 @@ pub(crate) fn discover_source(source: &SourceConfig) -> Result<SourceDiscovery> 
         },
         SourceKind::Omp => discover_omp_json(&path, &payload, &mut discovery)?,
     }
-    if discovery
-        .credentials
-        .iter()
-        .any(|credential| credential.auth.kind == CredentialKind::OAuth)
-    {
-        discovery.warnings.push(JSON_RACE_WARNING.to_owned());
-    }
     Ok(discovery)
 }
 
@@ -411,9 +403,6 @@ fn discover_sqlite(path: &Path, file: &File) -> Result<SourceDiscovery> {
         credentials: Vec::new(),
         warnings: Vec::new(),
     };
-    if !lease_supported {
-        discovery.warnings.push("This OMP database has no shared refresh lease table; advisory locking coordinates agent-usage only, so another application's simultaneous OAuth refresh can still rotate the grant".to_owned());
-    }
     while let Some(row) = rows
         .next()
         .map_err(|_| eyre!("cannot read OMP credential row"))?
@@ -606,7 +595,7 @@ fn persist_json(origin: &mut JsonOrigin, prior: &AuthRecord, current: &AuthRecor
         return Err(eyre!("refresh conflict: credential directory was replaced"));
     }
     // The stable sidecar protects our writers across rename. Foreign writers that
-    // ignore both advisory locks retain a check-to-rename race; discovery says so.
+    // ignore both advisory locks retain a check-to-rename race.
     temporary
         .persist(&origin.path)
         .map_err(|_| eyre!("cannot atomically replace credential source"))?;

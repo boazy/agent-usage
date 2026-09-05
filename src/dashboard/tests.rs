@@ -5,6 +5,7 @@ use super::{
 use crate::config::{AccountExclusion, DashboardConfig, SourceConfig, SourceKind};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use eyre::Result;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -173,6 +174,7 @@ struct FixtureServer {
     requests: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
+    release_delayed: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -188,6 +190,8 @@ impl FixtureServer {
         let control = Arc::clone(&stop);
         let count = Arc::clone(&requests);
         let peak = Arc::clone(&maximum);
+        let release_delayed = Arc::new(AtomicBool::new(false));
+        let release = Arc::clone(&release_delayed);
         let worker = std::thread::spawn(move || {
             let mut connections = Vec::new();
             while !control.load(Ordering::SeqCst) {
@@ -196,6 +200,8 @@ impl FixtureServer {
                         let count = Arc::clone(&count);
                         let active = Arc::clone(&active);
                         let peak = Arc::clone(&peak);
+                        let release = Arc::clone(&release);
+                        let control = Arc::clone(&control);
                         connections.push(std::thread::spawn(move || {
                             let _ = socket.set_nonblocking(false);
                             let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
@@ -212,6 +218,13 @@ impl FixtureServer {
                             peak.fetch_max(current, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_millis(80));
                             let request = String::from_utf8_lossy(&data);
+                            if request.contains("-delayed") {
+                                while !release.load(Ordering::SeqCst)
+                                    && !control.load(Ordering::SeqCst)
+                                {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                            }
                             let (status, body) = if request.starts_with("GET /api/auth/me ") {
                                 ("200 OK", r#"{"sub":"user_fixture","email":"person@example.invalid","name":"Fixture Person"}"#)
                             } else if request.starts_with("GET /api/usage-summary ") {
@@ -241,6 +254,7 @@ impl FixtureServer {
             requests,
             maximum,
             stop,
+            release_delayed,
             worker: Some(worker),
         })
     }
@@ -302,6 +316,52 @@ async fn visible_refresh_is_bounded_single_flight_and_failure_isolated() -> Resu
     );
     assert!(!serde_json::to_string(&first)?.contains("MUST-NOT-LEAK"));
     assert!(dashboard.states[3].lock().await.snapshot.is_none());
+    drop(file);
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_stream_publishes_ready_account_before_sibling_settles() -> Result<()> {
+    let server = FixtureServer::start()?;
+    let (file, source) = fixture(
+        &json!({"openrouter":[
+            {"type":"api_key","key":"synthetic-failed-delayed-key"},
+            {"type":"api_key","key":"synthetic-fast-key"}
+        ]}),
+        SourceKind::Omp,
+        "fixture",
+    )?;
+    let mut dashboard = Dashboard::load(&DashboardConfig {
+        sources: vec![source],
+        concurrency: 2,
+        ..DashboardConfig::default()
+    })?;
+    dashboard.test_endpoint = Some(server.endpoint.clone());
+    let ids: Vec<_> = dashboard
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect();
+    let updates = dashboard.refresh_stream(&ids);
+    futures_util::pin_mut!(updates);
+    let (index, first) = tokio::time::timeout(Duration::from_secs(2), updates.next())
+        .await?
+        .ok_or_else(|| eyre::eyre!("missing early completion"))?;
+    assert_eq!(index, 1);
+    assert_eq!(first.account.id, ids[1]);
+    assert!(first.usage.is_some());
+    assert!(!server.release_delayed.load(Ordering::SeqCst));
+    server.release_delayed.store(true, Ordering::SeqCst);
+    let remaining: Vec<_> = updates.collect().await;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].0, 0);
+    assert!(remaining[0].1.error.is_some());
+    assert!(dashboard.states[1]
+        .lock()
+        .await
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.usage.is_some()));
     drop(file);
     Ok(())
 }

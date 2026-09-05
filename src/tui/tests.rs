@@ -60,6 +60,11 @@ fn view() -> DashboardView {
                 )
             })
             .collect(),
+        completed: vec![true; 12],
+        pending: std::collections::BTreeSet::new(),
+        refresh_completed: 0,
+        refresh_failures: 0,
+        loading_scroll: 0,
         filter: String::new(),
         provider: None,
         account: None,
@@ -131,7 +136,8 @@ fn refresh_uses_screen_intersection_and_merge_preserves_unseen_state() {
     let mut updated = view.snapshots[11].clone();
     updated.fetched_at = Some(200);
     updated.error = Some("isolated failure".to_owned());
-    view.merge(vec![updated]);
+    view.pending.insert(11);
+    view.complete(11, updated);
     assert_eq!(view.snapshots[0].fetched_at, previous);
     assert_eq!(view.snapshots[11].fetched_at, Some(200));
     assert_eq!(
@@ -241,7 +247,7 @@ fn opaque_identity_is_hidden_in_overview_and_picker_but_visible_in_single_detail
 #[test]
 fn pane_padding_is_blank_and_visible_refresh_uses_the_padded_bottom_edge() -> Result<()> {
     let mut view = view();
-    let panes = view.panes(100);
+    let panes = view.panes(100, None);
     let bottom = panes[0].height;
     let top = DashboardView::content_area(Rect::new(0, 0, 100, 24)).y;
     let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 24))?;
@@ -262,6 +268,151 @@ fn pane_padding_is_blank_and_visible_refresh_uses_the_padded_bottom_edge() -> Re
         key(&mut view, KeyCode::Char('a'));
         let _ = screen(&mut view, width, height)?;
         key(&mut view, KeyCode::Enter);
+    }
+    Ok(())
+}
+
+#[test]
+fn progressive_completions_reveal_accounts_without_hiding_sibling_successes() -> Result<()> {
+    let mut view = view();
+    view.snapshots.truncate(3);
+    view.completed = vec![false; 3];
+    view.pending = (0..3).collect();
+    for snapshot in &mut view.snapshots {
+        snapshot.usage = None;
+        snapshot.fetched_at = None;
+    }
+    let initial = screen(&mut view, 100, 40)?;
+    assert!(!initial.contains("User 0"));
+    assert!(!initial.contains("User 1"));
+    assert_eq!(view.loading_providers(), ["Claude", "Codex"]);
+    assert!(view.visible_ids(Rect::new(0, 0, 100, 40)).is_empty());
+    key(&mut view, KeyCode::End);
+    screen(&mut view, 100, 40)?;
+    assert_eq!(view.scroll, 0);
+
+    let mut first = snapshot(0, Provider::Codex);
+    first.fetched_at = None;
+    view.complete(0, first);
+    let early = screen(&mut view, 100, 40)?;
+    assert!(early.contains("User 0"));
+    assert!(!early.contains("User 1"));
+    assert!(!early.contains("User 2"));
+    assert_eq!(view.loading_providers(), ["Claude", "Codex"]);
+    view.account = Some("account-0".to_owned());
+    assert_eq!(view.loading_providers(), ["Claude", "Codex"]);
+    assert!(!screen(&mut view, 100, 40)?.contains("User 1"));
+    view.account = None;
+
+    let mut failed = snapshot(2, Provider::Codex);
+    failed.usage = None;
+    failed.error = Some("isolated request failure".to_owned());
+    view.complete(2, failed);
+    let partial = screen(&mut view, 100, 40)?;
+    assert!(partial.contains("User 0"));
+    assert!(partial.contains("User 2"));
+    assert!(partial.contains("isolated request failure"));
+    assert!(view.snapshots[0].usage.is_some());
+    assert_eq!(view.loading_providers(), ["Claude"]);
+    view.complete(1, snapshot(1, Provider::Claude));
+    assert!(!screen(&mut view, 100, 40)?.contains(" Loading "));
+    assert_eq!(view.visible_ids(Rect::new(0, 0, 100, 40)).len(), 3);
+    Ok(())
+}
+
+#[test]
+fn refresh_keeps_ready_data_and_pending_matches_do_not_reveal_opaque_ids() -> Result<()> {
+    let mut view = view();
+    let opaque = "a72ac094-56d6-4e0c-bd20-f4ce7cb94132";
+    view.snapshots[0].account.account_id = Some(opaque.to_owned());
+    view.provider = Some("codex".to_owned());
+    view.completed = vec![false; 12];
+    view.completed[0] = true;
+    view.pending = [0, 2, 4, 6, 8, 10].into_iter().collect();
+    let loading = screen(&mut view, 100, 40)?;
+    assert!(loading.contains("User 0"));
+    assert!(loading.contains("42"));
+    assert!(!loading.contains(opaque));
+    assert_eq!(view.loading_providers(), ["Codex"]);
+    assert_eq!(view.visible_ids(Rect::new(0, 0, 100, 40)), ["account-0"]);
+    view.pending.remove(&0);
+    view.fail_pending("refresh canceled");
+    assert!(view.loading_providers().is_empty());
+    assert!(view.snapshots[0].usage.is_some());
+    let canceled = screen(&mut view, 100, 80)?;
+    assert!(canceled.contains("User 10"));
+    assert!(canceled.contains("refresh canceled"));
+    view.account = Some("account-0".to_owned());
+    assert!(screen(&mut view, 100, 40)?.contains(opaque));
+    Ok(())
+}
+
+#[test]
+fn loading_reservation_keeps_right_column_bottom_reachable_and_refresh_visible_only() -> Result<()>
+{
+    let mut view = view();
+    view.completed[11] = false;
+    view.pending.insert(11);
+    let area = Rect::new(0, 0, 100, 24);
+    let content = DashboardView::content_area(area);
+    let reserved = DashboardView::loading_area(content, &view.loading_providers())
+        .ok_or_else(|| eyre::eyre!("missing loading footprint"))?;
+    assert_eq!(reserved.right(), content.width);
+    assert_eq!(reserved.bottom(), content.height);
+    let panes = view.panes(content.width, Some(reserved));
+    let right = panes
+        .iter()
+        .filter(|pane| pane.x >= reserved.x)
+        .max_by_key(|pane| pane.y + usize::from(pane.height))
+        .ok_or_else(|| eyre::eyre!("missing right column pane"))?;
+    let height = super::pane_viewport_height(right, content.height, Some(reserved));
+    view.scroll = (right.y + usize::from(right.height)).saturating_sub(usize::from(height));
+    let expected = view.snapshots[right.index].account.id.clone();
+    let visible = view.visible_ids(area);
+    assert!(visible.contains(&expected));
+    assert!(!visible.contains(&"account-11".to_owned()));
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(area.width, area.height))?;
+    terminal.draw(|frame| view.draw(frame))?;
+    assert_eq!(
+        terminal.backend().buffer()[(right.x + right.width - 1, content.y + height - 1)].symbol(),
+        "┘"
+    );
+    assert_eq!(
+        terminal.backend().buffer()[(reserved.right() - 1, content.y + reserved.bottom() - 1)]
+            .symbol(),
+        "┘"
+    );
+    view.complete(11, snapshot(11, Provider::Claude));
+    view.scroll = usize::MAX;
+    assert!(view.visible_ids(area).contains(&"account-11".to_owned()));
+    assert!(DashboardView::loading_area(content, &view.loading_providers()).is_none());
+    Ok(())
+}
+
+#[test]
+fn many_loading_providers_page_without_consuming_narrow_ready_viewport() -> Result<()> {
+    let mut view = view();
+    for (index, snapshot) in view.snapshots.iter_mut().enumerate().skip(1) {
+        snapshot.account.provider = Provider::Other(format!("Provider-{index:02}"));
+        view.completed[index] = false;
+        view.pending.insert(index);
+    }
+    let content = DashboardView::content_area(Rect::new(0, 0, 44, 12));
+    let reserved = DashboardView::loading_area(content, &view.loading_providers())
+        .ok_or_else(|| eyre::eyre!("missing loading footprint"))?;
+    assert!(reserved.y >= 4);
+    let first = screen(&mut view, 44, 12)?;
+    assert!(first.contains("User 0"));
+    assert!(first.contains("Provider-01"));
+    assert!(!first.contains("Provider-11"));
+    for _ in 0..12 {
+        key(&mut view, KeyCode::Char(']'));
+    }
+    let last = screen(&mut view, 44, 12)?;
+    assert!(last.contains("Provider-11"));
+    assert!(!last.contains("Provider-01"));
+    for (width, height) in [(1, 1), (2, 2), (10, 3), (20, 4), (44, 5)] {
+        screen(&mut view, width, height)?;
     }
     Ok(())
 }
