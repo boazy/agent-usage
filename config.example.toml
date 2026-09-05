@@ -3,6 +3,8 @@
 # Explicit alternative: agent-usage --config ./config.toml
 
 theme = "default"
+# Additional palettes: everforest, kanagawa, rose-pine, rose-pine-dawn,
+# ayu-dark, catppuccin-latte. README lists all 22; TUI `t` searches themes.
 concurrency = 4          # 1..32 concurrent accounts, shared across refresh calls
 timeout_seconds = 20    # 1..300; includes an account's OAuth refresh and usage calls
 refresh_seconds = 60    # TUI automatic refresh, visible panes only
@@ -15,9 +17,9 @@ refresh_seconds = 60    # TUI automatic refresh, visible panes only
 # A kind ("omp" or "codex") excludes every source of that kind.
 # A configured source name excludes only that source.
 sources = []
-providers = []          # e.g. ["antigravity"]
+providers = []          # e.g. ["antigravity", "cursor"]
 emails = []             # e.g. ["personal@example.com"] across all providers
-account_ids = []        # stored account/workspace IDs or dashboard IDs from --json
+account_ids = []        # stored IDs or --json dashboard IDs; opaque IDs are hidden in overviews
 api_keys = []           # e.g. ["sk-o*1234"] or ["*1234"]; never put a full key here
 
 # Both fields must match for a provider-specific email exclusion.

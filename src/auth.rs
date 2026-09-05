@@ -16,6 +16,7 @@ pub(crate) struct AuthRecord {
     pub(crate) refresh_token: Option<String>,
     pub(crate) account_id: Option<String>,
     pub(crate) email: Option<String>,
+    pub(crate) name: Option<String>,
     pub(crate) oauth_client_id: Option<String>,
     pub(crate) kind: CredentialKind,
     /// Unix epoch milliseconds, matching OMP's persisted `expires` field.
@@ -35,6 +36,7 @@ impl AuthRecord {
             refresh_token: None,
             account_id: None,
             email: None,
+            name: None,
             oauth_client_id: None,
             expires_at: None,
             project_id: None,
@@ -113,6 +115,16 @@ impl AuthRecord {
         }
         if *provider == Provider::Codex && self.org_id.is_none() {
             self.org_id.clone_from(&self.account_id);
+        }
+        if *provider == Provider::Cursor {
+            if let Some(user_id) = cursor_user_id(&self.access_token) {
+                self.subject = Some(user_id);
+            }
+            if self.name.is_none() {
+                self.name = access
+                    .as_ref()
+                    .and_then(|claims| string_field(claims, "name"));
+            }
         }
         if self.expires_at.is_none() {
             self.expires_at = access
@@ -207,6 +219,17 @@ pub(crate) fn string_field(value: &Value, field: &str) -> Option<String> {
         .as_str()
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
+}
+
+pub(crate) fn cursor_user_id(token: &str) -> Option<String> {
+    let claims = parse_jwt(token)?;
+    let subject = string_field(&claims, "sub")?;
+    let user_id = subject.split('|').nth(1).unwrap_or(&subject).trim();
+    (!user_id.is_empty()).then(|| user_id.to_owned())
+}
+
+pub(crate) fn token_expiry(token: &str) -> Option<i64> {
+    parse_jwt(token)?.get("exp")?.as_i64()?.checked_mul(1_000)
 }
 
 fn parse_jwt(token: &str) -> Option<Value> {

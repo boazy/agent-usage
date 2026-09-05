@@ -1,4 +1,7 @@
-use crate::dashboard::{AccountSnapshot, UsageMetric};
+use crate::dashboard::{
+    AccountInfo, AccountSnapshot, AccountUsage, BankedReset, CreditAmount, CreditCount, CreditUnit,
+    Currency, UsageAllowance, UsageCredits,
+};
 use crate::theme::Theme;
 use crate::time::{now_millis, Millis};
 use crate::usage::human_duration;
@@ -7,11 +10,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget};
+use sha2::{Digest, Sha256};
 use std::io::{self, IsTerminal, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub(crate) const MIN_PANE_WIDTH: u16 = 44;
+const PANE_PADDING: u16 = 1;
 
 pub(crate) struct AccountPane {
     title: Line<'static>,
@@ -20,34 +25,71 @@ pub(crate) struct AccountPane {
 }
 
 impl AccountPane {
-    pub(crate) fn new(snapshot: &AccountSnapshot, width: u16, theme: Theme, color: bool) -> Self {
-        let inner_width = width.saturating_sub(2).max(1);
+    pub(crate) fn new(
+        snapshot: &AccountSnapshot,
+        width: u16,
+        theme: Theme,
+        color: bool,
+        show_account_id: bool,
+    ) -> Self {
+        let inner_width = width.saturating_sub(2 + 2 * PANE_PADDING).max(1);
         let mut lines = Vec::new();
-        let muted = style(theme.window, color);
         let title = Line::from(Span::styled(
             format!(
                 " {} · {} ",
-                clean(&snapshot.account.label),
-                snapshot.account.provider
+                account_label(&snapshot.account),
+                clean(&snapshot.account.provider.to_string())
             ),
-            style(theme.meter, color).add_modifier(Modifier::BOLD),
+            style(theme.title, color),
         ));
-        push_wrapped(
+        push_field(
             &mut lines,
-            format!("Sources: {}", snapshot.account.sources.join(", ")),
-            muted,
+            "Sources: ",
+            snapshot.account.sources.join(", "),
+            theme.label,
+            theme.source,
             inner_width,
+            color,
         );
-        if let Some(id) = &snapshot.account.account_id {
-            push_wrapped(
+        if let Some(name) = snapshot
+            .account
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty() && *name != snapshot.account.label)
+        {
+            push_field(
                 &mut lines,
-                format!("Account: {}", clean(id)),
-                muted,
+                "Name: ",
+                clean(name),
+                theme.label,
+                theme.account,
                 inner_width,
+                color,
             );
         }
+        if let Some(id) = &snapshot.account.account_id {
+            if show_account_id || !opaque_id(id) {
+                push_field(
+                    &mut lines,
+                    "Account: ",
+                    clean(id),
+                    theme.label,
+                    theme.account,
+                    inner_width,
+                    color,
+                );
+            }
+        }
         if let Some(mask) = &snapshot.account.masked_key {
-            push_wrapped(&mut lines, format!("API key: {mask}"), muted, inner_width);
+            push_field(
+                &mut lines,
+                "API key: ",
+                clean(mask),
+                theme.label,
+                theme.account,
+                inner_width,
+                color,
+            );
         }
         if let Some(error) = &snapshot.error {
             push_wrapped(
@@ -57,46 +99,7 @@ impl AccountPane {
                 inner_width,
             );
         } else if let Some(usage) = &snapshot.usage {
-            if let Some(plan) = &usage.plan {
-                push_wrapped(
-                    &mut lines,
-                    format!("Plan: {}", clean(plan)),
-                    style(theme.meter, color),
-                    inner_width,
-                );
-            }
-            for metric in &usage.windows {
-                append_metric(&mut lines, metric, inner_width, theme, color);
-            }
-            for credit in &usage.credits {
-                push_wrapped(
-                    &mut lines,
-                    format!(
-                        "{}: {} {}",
-                        clean(&credit.name),
-                        credit.balance,
-                        clean(&credit.unit)
-                    ),
-                    style(theme.meter, color),
-                    inner_width,
-                );
-                if let Some(expires) = credit.expires_at {
-                    push_wrapped(
-                        &mut lines,
-                        format!("  expires {}", countdown(expires)),
-                        style(theme.reset, color),
-                        inner_width,
-                    );
-                }
-            }
-            if usage.windows.is_empty() && usage.credits.is_empty() {
-                push_wrapped(
-                    &mut lines,
-                    "No quota amounts reported".to_owned(),
-                    style(theme.unknown, color),
-                    inner_width,
-                );
-            }
+            append_usage(&mut lines, usage, inner_width, theme, color);
         } else {
             push_wrapped(
                 &mut lines,
@@ -116,14 +119,14 @@ impl AccountPane {
         Self {
             title,
             lines,
-            border: muted,
+            border: style(theme.border, color),
         }
     }
 
     pub(crate) fn height(&self) -> u16 {
         u16::try_from(self.lines.len())
-            .unwrap_or(u16::MAX - 2)
-            .saturating_add(2)
+            .unwrap_or(u16::MAX)
+            .saturating_add(2 + 2 * PANE_PADDING)
     }
 }
 
@@ -132,6 +135,7 @@ impl Widget for &AccountPane {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(self.border)
+            .padding(Padding::uniform(PANE_PADDING))
             .title(self.title.clone());
         let inner = block.inner(area);
         block.render(area, buffer);
@@ -139,81 +143,264 @@ impl Widget for &AccountPane {
     }
 }
 
-fn append_metric(
+fn append_usage(
     lines: &mut Vec<Line<'static>>,
-    metric: &UsageMetric,
+    usage: &AccountUsage,
     width: u16,
     theme: Theme,
     color: bool,
 ) {
-    let value = metric
-        .used_percent
-        .filter(|value| value.is_finite())
-        .map_or_else(
-            || match (metric.used, metric.limit) {
-                (Some(used), Some(limit)) => format!(
-                    "{used:.2} / {limit:.2} {}",
-                    metric.unit.as_deref().unwrap_or("")
-                ),
-                (Some(used), None) => format!("{used:.2} {}", metric.unit.as_deref().unwrap_or("")),
-                (None, Some(limit)) => {
-                    format!("limit {limit:.2} {}", metric.unit.as_deref().unwrap_or(""))
-                }
-                (None, None) => "unknown".to_owned(),
-            },
-            |percent| format!("{percent:.1}%"),
+    if let Some(plan) = &usage.plan {
+        push_field(
+            lines,
+            "Plan: ",
+            clean(plan),
+            theme.label,
+            theme.plan,
+            width,
+            color,
         );
-    push_wrapped(
-        lines,
-        format!("{}: {value}", clean(&metric.name)),
+    }
+    for allowance in &usage.limits.allowances {
+        append_allowance(lines, allowance, width, theme, color);
+    }
+    for balance in &usage.limits.balances {
+        push_field(
+            lines,
+            &format!("{}: ", clean(&balance.title)),
+            credit_value(&balance.credits, balance.credits.remaining()),
+            theme.meter,
+            theme.account,
+            width,
+            color,
+        );
+        if let Some(expires) = balance.expires_at {
+            push_reset(lines, "expires", Some(expires), width, theme, color);
+        }
+    }
+    if !usage.limits.banked_resets.is_empty() {
+        push_wrapped(
+            lines,
+            "Banked resets".to_owned(),
+            style(theme.meter, color),
+            width,
+        );
+        for reset in &usage.limits.banked_resets {
+            append_banked_reset(lines, reset, width, theme, color);
+        }
+    }
+    if let Some(resets) = usage.limits.global_reset_at {
+        push_reset(
+            lines,
+            "subscription resets",
+            Some(resets),
+            width,
+            theme,
+            color,
+        );
+    }
+    if usage.limits.allowances.is_empty()
+        && usage.limits.balances.is_empty()
+        && usage.limits.banked_resets.is_empty()
+    {
+        push_wrapped(
+            lines,
+            "No quota amounts reported".to_owned(),
+            style(theme.unknown, color),
+            width,
+        );
+    }
+}
+
+fn append_allowance(
+    lines: &mut Vec<Line<'static>>,
+    allowance: &UsageAllowance,
+    width: u16,
+    theme: Theme,
+    color: bool,
+) {
+    let mut heading = vec![Span::styled(
+        clean(&allowance.title),
         style(theme.meter, color),
-        width,
-    );
-    if let Some(percent) = metric.used_percent.filter(|value| value.is_finite()) {
+    )];
+    if let Some(window) = &allowance.window {
+        heading.push(Span::styled(
+            format!(" ({})", clean(&window.to_string())),
+            style(theme.window, color),
+        ));
+    }
+    heading.push(Span::styled(
+        format!(": {}", credit_value(&allowance.credits, None)),
+        style(theme.account, color),
+    ));
+    push_styled(lines, heading, width);
+    if let Some(percent) = allowance
+        .credits
+        .used_percent()
+        .filter(|percent| percent.is_finite())
+    {
         lines.push(gauge(
             width,
             percent,
             style(theme.bar_primary, color),
             style(theme.bar_background, color),
         ));
-        if metric.used.is_some()
-            && metric
-                .unit
-                .as_deref()
-                .is_some_and(|unit| unit != "percent" && unit != "%")
-        {
-            let amount = metric.used.unwrap_or(0.0);
-            let text = metric.limit.map_or_else(
-                || {
-                    format!(
-                        "  used {amount:.2} {}",
-                        metric.unit.as_deref().unwrap_or("")
-                    )
-                },
-                |limit| {
-                    format!(
-                        "  {amount:.2} / {limit:.2} {}",
-                        metric.unit.as_deref().unwrap_or("")
-                    )
-                },
-            );
-            push_wrapped(lines, text, style(theme.window, color), width);
-        }
     }
-    if let Some(resets) = metric.resets_at {
-        push_wrapped(
-            lines,
-            format!("  resets {}", countdown(resets)),
-            style(theme.reset, color),
-            width,
-        );
+    if let Some(resets) = allowance.resets_at {
+        push_reset(lines, "resets", Some(resets), width, theme, color);
     }
 }
 
-fn countdown(timestamp: i64) -> String {
-    let Some(then) = u64::try_from(timestamp).ok().map(Millis::new) else {
-        return "unknown".to_owned();
+fn credit_value(credits: &UsageCredits, display_remaining: Option<CreditAmount>) -> String {
+    let unit = match &credits.unit {
+        CreditUnit::Currency(Currency::Usd) => " USD".to_owned(),
+        CreditUnit::Currency(Currency::Other(currency)) => format!(" {}", clean(currency)),
+        CreditUnit::GenericCredits => " credits".to_owned(),
+        CreditUnit::Percentage => "%".to_owned(),
+        CreditUnit::Unknown => String::new(),
     };
+    if let Some(remaining) = display_remaining {
+        return format!("{}{unit} remaining", amount_value(remaining, &credits.unit));
+    }
+    match &credits.count {
+        CreditCount::Full {
+            allocated,
+            consumed,
+        } => {
+            if credits.unit == CreditUnit::Percentage {
+                if let Some(percent) = credits.used_percent() {
+                    return format!("{percent:.1}%");
+                }
+            }
+            format!(
+                "{} / {}{unit}",
+                amount_value(*consumed, &credits.unit),
+                amount_value(*allocated, &credits.unit)
+            )
+        }
+        CreditCount::Remaining(amount) => {
+            format!("{}{unit} remaining", amount_value(*amount, &credits.unit))
+        }
+        CreditCount::Consumed(amount) => format!("{}{unit}", amount_value(*amount, &credits.unit)),
+        CreditCount::Allocated(amount) => {
+            format!("limit {}{unit}", amount_value(*amount, &credits.unit))
+        }
+        CreditCount::Unknown => "unknown".to_owned(),
+    }
+}
+
+fn amount_value(amount: CreditAmount, unit: &CreditUnit) -> String {
+    match (amount, unit) {
+        (CreditAmount::Integer(value), CreditUnit::Currency(_)) => format!("{value}.00"),
+        (CreditAmount::Decimal(value), CreditUnit::Currency(_)) => format!("{value:.2}"),
+        _ => amount.to_string(),
+    }
+}
+
+fn push_reset(
+    lines: &mut Vec<Line<'static>>,
+    verb: &str,
+    at: Option<Millis>,
+    width: u16,
+    theme: Theme,
+    color: bool,
+) {
+    let (label, value) = reset_text(verb, at);
+    push_field(
+        lines,
+        &label,
+        value,
+        theme.reset_label,
+        theme.reset_time,
+        width,
+        color,
+    );
+}
+
+fn reset_text(verb: &str, at: Option<Millis>) -> (String, String) {
+    let value = at.map_or_else(|| "unknown".to_owned(), countdown);
+    let label = if matches!(value.as_str(), "now" | "unknown") {
+        format!("{verb} ")
+    } else {
+        format!("{verb} in ")
+    };
+    (label, value)
+}
+
+fn append_banked_reset(
+    lines: &mut Vec<Line<'static>>,
+    reset: &BankedReset,
+    width: u16,
+    theme: Theme,
+    color: bool,
+) {
+    let (label, value) = reset_text("expires", reset.expires_at);
+    let mut available = usize::from(width);
+    let value = truncate_text(&value, available);
+    available = available.saturating_sub(value.width());
+    let label = truncate_text(&label, available);
+    available = available.saturating_sub(label.width());
+    let count = match reset.count {
+        Some(1) => String::new(),
+        Some(count) => format!("×{count} · "),
+        None => "count unknown · ".to_owned(),
+    };
+    let count = truncate_text(&count, available);
+    available = available.saturating_sub(count.width());
+    let title = if available >= 4 {
+        format!("{} · ", truncate_text(&clean(&reset.title), available - 3))
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{title}{count}"), style(theme.account, color)),
+        Span::styled(label, style(theme.reset_label, color)),
+        Span::styled(value, style(theme.reset_time, color)),
+    ]));
+}
+
+fn truncate_text(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut columns = 0;
+    for character in value.chars() {
+        let advance = character.width().unwrap_or(0);
+        if columns + advance >= width {
+            break;
+        }
+        result.push(character);
+        columns += advance;
+    }
+    result.push('…');
+    result
+}
+
+fn push_field(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    mut value: String,
+    label_style: anstyle::Style,
+    value_style: anstyle::Style,
+    width: u16,
+    color: bool,
+) {
+    value.retain(|character| !character.is_control());
+    push_styled(
+        lines,
+        vec![
+            Span::styled(label.to_owned(), style(label_style, color)),
+            Span::styled(value, style(value_style, color)),
+        ],
+        width,
+    );
+}
+
+fn countdown(then: Millis) -> String {
     now_millis().map_or_else(
         || "unknown".to_owned(),
         |now| {
@@ -221,29 +408,46 @@ fn countdown(timestamp: i64) -> String {
             if seconds == 0 {
                 "now".to_owned()
             } else {
-                format!("in {}", human_duration(seconds))
+                human_duration(seconds)
             }
         },
     )
 }
 
 fn push_wrapped(lines: &mut Vec<Line<'static>>, text: String, style: Style, width: u16) {
-    if text.width() <= usize::from(width) {
-        lines.push(Line::from(Span::styled(text, style)));
-        return;
-    }
-    let mut part = String::new();
+    push_styled(lines, vec![Span::styled(text, style)], width);
+}
+
+fn push_styled(lines: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>, width: u16) {
+    let width = usize::from(width.max(1));
+    let mut row = Vec::new();
     let mut columns = 0;
-    for character in text.chars() {
-        let advance = character.width().unwrap_or(0);
-        if columns + advance > usize::from(width) && !part.is_empty() {
-            lines.push(Line::from(Span::styled(std::mem::take(&mut part), style)));
-            columns = 0;
+    for span in spans {
+        let mut part = String::new();
+        for character in span.content.chars() {
+            let advance = character.width().unwrap_or(0);
+            if columns + advance > width && columns != 0 {
+                if !part.is_empty() {
+                    row.push(Span::styled(std::mem::take(&mut part), span.style));
+                }
+                lines.push(Line::from(std::mem::take(&mut row)));
+                columns = 0;
+            }
+            if advance > width {
+                part.push('�');
+                columns += 1;
+            } else {
+                part.push(character);
+                columns += advance;
+            }
         }
-        part.push(character);
-        columns += advance;
+        if !part.is_empty() {
+            row.push(Span::styled(part, span.style));
+        }
     }
-    lines.push(Line::from(Span::styled(part, style)));
+    if !row.is_empty() {
+        lines.push(Line::from(row));
+    }
 }
 
 #[expect(
@@ -285,6 +489,7 @@ pub(crate) fn layout_panes(
     width: u16,
     theme: Theme,
     color: bool,
+    show_account_id: bool,
 ) -> Vec<PlacedPane> {
     let width = width.max(1);
     let columns = usize::from((width / MIN_PANE_WIDTH).max(1));
@@ -298,7 +503,13 @@ pub(crate) fn layout_panes(
         let mut row_height = 0;
         for (column, &index) in row.iter().enumerate() {
             let pane_width = base_width + u16::from(column < usize::from(extra));
-            let pane = AccountPane::new(&snapshots[index], pane_width, theme, color);
+            let pane = AccountPane::new(
+                &snapshots[index],
+                pane_width,
+                theme,
+                color,
+                show_account_id && indices.len() == 1,
+            );
             let height = pane.height();
             row_height = row_height.max(height);
             result.push(PlacedPane {
@@ -340,7 +551,7 @@ pub(crate) fn render_report(
 ) -> io::Result<()> {
     let color = color_enabled();
     let indices: Vec<_> = (0..snapshots.len()).collect();
-    let panes = layout_panes(snapshots, &indices, width, theme, color);
+    let panes = layout_panes(snapshots, &indices, width, theme, color, false);
     let mut output = anstream::AutoStream::auto(io::stdout().lock());
     if panes.is_empty() {
         return writeln!(
@@ -418,6 +629,12 @@ pub(crate) fn style(value: anstyle::Style, enabled: bool) -> Style {
     if value.get_effects().contains(Effects::BOLD) {
         result = result.add_modifier(Modifier::BOLD);
     }
+    if value.get_effects().contains(Effects::ITALIC) {
+        result = result.add_modifier(Modifier::ITALIC);
+    }
+    if value.get_effects().contains(Effects::UNDERLINE) {
+        result = result.add_modifier(Modifier::UNDERLINED);
+    }
     result
 }
 
@@ -438,7 +655,13 @@ fn ansi_style(value: Style) -> anstyle::Style {
         result = result.bg_color(Some(color));
     }
     if value.add_modifier.contains(Modifier::BOLD) {
-        result = result.effects(Effects::BOLD);
+        result = result.bold();
+    }
+    if value.add_modifier.contains(Modifier::ITALIC) {
+        result = result.italic();
+    }
+    if value.add_modifier.contains(Modifier::UNDERLINED) {
+        result = result.underline();
     }
     result
 }
@@ -475,6 +698,50 @@ fn clean(value: &str) -> String {
         .chars()
         .filter(|character| !character.is_control())
         .collect()
+}
+
+pub(crate) fn opaque_id(value: &str) -> bool {
+    let value = value.trim();
+    let compact_len = value.bytes().filter(|byte| *byte != b'-').count();
+    (compact_len >= 6
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-'))
+        || (compact_len >= 16
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'))
+        || (value.len() >= 16
+            && !value.contains(char::is_whitespace)
+            && !value.contains('@')
+            && value.bytes().any(|byte| byte.is_ascii_digit())
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+}
+
+pub(crate) fn short_account_id(account: &AccountInfo) -> String {
+    let digest = Sha256::digest(account.id.as_bytes());
+    format!("{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2])
+}
+
+pub(crate) fn account_label(account: &AccountInfo) -> String {
+    let mut label = clean(&account.label);
+    if let Some(id) = account.account_id.as_deref().filter(|id| opaque_id(id)) {
+        label
+            .replace(id, "")
+            .trim_matches([' ', '·', '-', '(', ')'])
+            .clone_into(&mut label);
+    }
+    if label.is_empty() || opaque_id(&label) {
+        return account
+            .email
+            .as_deref()
+            .map(clean)
+            .or_else(|| account.masked_key.as_deref().map(clean))
+            .unwrap_or_else(|| format!("Account #{}", short_account_id(account)));
+    }
+    label
 }
 
 #[cfg(test)]
@@ -514,39 +781,221 @@ mod tests {
 
     #[test]
     fn gauge_preserves_theme_pair_at_all_usage_levels_and_unknown_has_no_bar() {
-        let theme = crate::theme::BUILTIN_THEMES[0];
-        let mut metric = crate::dashboard::UsageMetric {
-            name: "Weekly".to_owned(),
-            used_percent: None,
-            used: None,
-            limit: None,
-            unit: None,
-            resets_at: None,
+        use crate::dashboard::{
+            CreditAmount, CreditCount, CreditUnit, UsageAllowance, UsageCredits,
         };
-        for percent in [0.0, 42.0, 95.0, 100.0] {
-            metric.used_percent = Some(percent);
-            let mut lines = Vec::new();
-            super::append_metric(&mut lines, &metric, 40, theme, true);
-            let bar = &lines[1];
-            for span in bar.spans.iter().filter(|span| !span.content.is_empty()) {
-                let expected = if span.content.contains('░') {
-                    theme.bar_background
-                } else {
-                    theme.bar_primary
+        for theme in crate::theme::BUILTIN_THEMES {
+            let mut allowance = UsageAllowance {
+                title: "Weekly".to_owned(),
+                window: None,
+                credits: UsageCredits {
+                    count: CreditCount::Unknown,
+                    unit: CreditUnit::Percentage,
+                },
+                resets_at: None,
+            };
+            for percent in [0.0, 42.0, 95.0, 100.0] {
+                allowance.credits.count = CreditCount::Full {
+                    allocated: CreditAmount::Integer(100),
+                    consumed: CreditAmount::Decimal(percent),
                 };
-                assert_eq!(span.style, super::style(expected, true));
+                let mut lines = Vec::new();
+                super::append_allowance(&mut lines, &allowance, 40, *theme, true);
+                let bar = &lines[1];
+                for span in bar.spans.iter().filter(|span| !span.content.is_empty()) {
+                    let expected = if span.content.contains('░') {
+                        theme.bar_background
+                    } else {
+                        theme.bar_primary
+                    };
+                    assert_eq!(span.style, super::style(expected, true));
+                }
+            }
+            allowance.credits.count = CreditCount::Unknown;
+            let mut lines = Vec::new();
+            super::append_allowance(&mut lines, &allowance, 40, *theme, false);
+            assert!(!lines
+                .iter()
+                .any(|line| line.to_string().contains(['█', '▓', '▒', '░'])));
+            assert!(lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style == Style::default()));
+        }
+    }
+
+    fn snapshot() -> crate::dashboard::AccountSnapshot {
+        use crate::dashboard::{
+            AccountInfo, AccountSnapshot, AccountUsage, CredentialKind, Provider,
+            SubscriptionLimits,
+        };
+        AccountSnapshot {
+            account: AccountInfo {
+                id: "synthetic-identity".to_owned(),
+                provider: Provider::Codex,
+                label: "Example".to_owned(),
+                name: None,
+                email: Some("example@example.test".to_owned()),
+                account_id: Some("93e4ca21-fb93-4d73-bfdc-688bfd73a012".to_owned()),
+                sources: vec!["fixture".to_owned()],
+                credential_kind: CredentialKind::OAuth,
+                masked_key: None,
+            },
+            usage: Some(AccountUsage {
+                limits: SubscriptionLimits::default(),
+                plan: Some("Pro".to_owned()),
+            }),
+            error: None,
+            warnings: Vec::new(),
+            fetched_at: None,
+        }
+    }
+
+    fn pane_text(
+        snapshot: &crate::dashboard::AccountSnapshot,
+        width: u16,
+        color: bool,
+        details: bool,
+    ) -> Result<(String, Buffer)> {
+        let pane = super::AccountPane::new(
+            snapshot,
+            width,
+            crate::theme::BUILTIN_THEMES[0],
+            color,
+            details,
+        );
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, pane.height()));
+        (&pane).render(buffer.area, &mut buffer);
+        let mut output = Vec::new();
+        write_buffer(&buffer, buffer.area, &mut output, color)?;
+        Ok((String::from_utf8(output)?, buffer))
+    }
+
+    #[test]
+    fn report_hides_opaque_identity_even_for_one_account_and_styles_semantic_fields() -> Result<()>
+    {
+        let mut snapshot = snapshot();
+        for id in ["93e4ca21-fb93-4d73-bfdc-688bfd73a012", "491827495821746289"] {
+            snapshot.account.account_id = Some(id.to_owned());
+            snapshot.account.label = id.to_owned();
+            let (overview, _) = pane_text(&snapshot, 100, false, false)?;
+            assert!(!overview.contains(id));
+            assert!(overview.contains("example@example.test"));
+            assert!(!overview.contains('\u{1b}'));
+            assert!(pane_text(&snapshot, 100, false, true)?.0.contains(id));
+        }
+        let (colored, buffer) = pane_text(&snapshot, 100, true, false)?;
+        assert!(colored.contains("\u{1b}[38;2;"));
+        assert_ne!(buffer[(2, 2)].fg, buffer[(11, 2)].fg);
+        assert_ne!(buffer[(2, 3)].fg, buffer[(8, 3)].fg);
+        for escape in colored.split('\u{1b}').skip(1) {
+            let command = escape.chars().find(char::is_ascii_alphabetic);
+            assert_eq!(
+                command,
+                Some('m'),
+                "reports may style text but never move the cursor"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn banked_resets_group_known_unknown_and_aggregate_expiries_without_inventing_counts(
+    ) -> Result<()> {
+        use crate::dashboard::BankedReset;
+        let mut snapshot = snapshot();
+        snapshot
+            .usage
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("fixture usage missing"))?
+            .limits
+            .banked_resets = vec![
+            BankedReset {
+                title: "Weekly".to_owned(),
+                count: Some(1),
+                expires_at: Some(crate::time::Millis::new(0)),
+            },
+            BankedReset {
+                title: "Weekly".to_owned(),
+                count: Some(4),
+                expires_at: None,
+            },
+            BankedReset {
+                title: "Monthly".to_owned(),
+                count: None,
+                expires_at: None,
+            },
+            BankedReset {
+                title: "A deliberately long allowance title that must fit one line".to_owned(),
+                count: Some(1),
+                expires_at: super::now_millis()
+                    .map(|now| crate::time::Millis::new(now.get() + 86_400_000)),
+            },
+        ];
+        let (text, _) = pane_text(&snapshot, 44, false, false)?;
+        assert_eq!(text.matches("Banked resets").count(), 1);
+        assert!(text.contains("Weekly · expires now"));
+        assert!(text.contains("Weekly · ×4 · expires unknown"));
+        assert!(text.contains("count unknown · expires unknown"));
+        assert_eq!(
+            text.lines().filter(|line| line.contains("expires")).count(),
+            4
+        );
+        assert_eq!(text.lines().count(), 11);
+        assert!(text.contains("… · expires in "));
+        let (_, buffer) = pane_text(&snapshot, 44, true, false)?;
+        let row: String = (0..44).map(|x| buffer[(x, 8)].symbol()).collect();
+        let offset = row
+            .find("expires in ")
+            .ok_or_else(|| eyre::eyre!("expiry label missing"))?;
+        let x = u16::try_from(unicode_width::UnicodeWidthStr::width(&row[..offset]))?;
+        assert_eq!(buffer[(x, 8)].fg, buffer[(x + 8, 8)].fg);
+        assert_ne!(buffer[(x + 8, 8)].fg, buffer[(x + 11, 8)].fg);
+        Ok(())
+    }
+
+    #[test]
+    fn window_and_reset_styles_survive_wrapping_and_missing_usage_never_gets_a_bar() -> Result<()> {
+        use crate::dashboard::{
+            AllowanceWindow, CreditAmount, CreditCount, CreditUnit, UsageAllowance, UsageCredits,
+        };
+        use ratatui::style::Modifier;
+        let mut snapshot = snapshot();
+        snapshot
+            .usage
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("fixture usage missing"))?
+            .limits
+            .allowances = vec![UsageAllowance {
+            title: "Spent".to_owned(),
+            window: Some(AllowanceWindow::Monthly),
+            resets_at: Some(crate::time::Millis::new(0)),
+            credits: UsageCredits {
+                count: CreditCount::Allocated(CreditAmount::Integer(100)),
+                unit: CreditUnit::GenericCredits,
+            },
+        }];
+        let (text, buffer) = pane_text(&snapshot, 100, true, false)?;
+        let plain: String = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(plain.contains("Spent (monthly): limit 100 credits"));
+        assert!(!plain.contains(['█', '▓', '▒', '░']));
+        assert!(buffer[(8, 4)].modifier.contains(Modifier::ITALIC));
+        assert_ne!(buffer[(2, 5)].fg, buffer[(10, 5)].fg);
+        assert!(text.contains("\u{1b}[3"));
+        for width in [5, 12, 44] {
+            let (text, buffer) = pane_text(&snapshot, width, false, true)?;
+            assert!(text
+                .lines()
+                .all(|line| unicode_width::UnicodeWidthStr::width(line) == usize::from(width)));
+            for row in 1..buffer.area.height - 1 {
+                assert_eq!(buffer[(1, row)].symbol(), " ");
+                assert_eq!(buffer[(width - 2, row)].symbol(), " ");
             }
         }
-        metric.used_percent = None;
-        let mut lines = Vec::new();
-        super::append_metric(&mut lines, &metric, 40, theme, false);
-        assert_eq!(
-            lines.iter().map(ToString::to_string).collect::<String>(),
-            "Weekly: unknown"
-        );
-        assert!(lines
-            .iter()
-            .flat_map(|line| &line.spans)
-            .all(|span| span.style == Style::default()));
+        Ok(())
     }
 }

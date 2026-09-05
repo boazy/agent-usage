@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-fn client() -> Result<Client> {
+pub(super) fn client() -> Result<Client> {
     Ok(Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -20,12 +20,12 @@ fn auth(kind: CredentialKind) -> AuthRecord {
     AuthRecord::new("synthetic-access".to_owned(), kind)
 }
 
-fn response(status: u16, body: &Value) -> String {
+pub(super) fn response(status: u16, body: &Value) -> String {
     let body = body.to_string();
     format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<String> {
+pub(super) fn read_request(stream: &mut TcpStream) -> Result<String> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     let mut bytes = Vec::new();
@@ -57,7 +57,7 @@ fn read_request(stream: &mut TcpStream) -> Result<String> {
     }
 }
 
-fn serve(replies: Vec<String>) -> Result<(String, JoinHandle<Result<Vec<String>>>)> {
+pub(super) fn serve(replies: Vec<String>) -> Result<(String, JoinHandle<Result<Vec<String>>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let base = format!("http://{}", listener.local_addr()?);
     listener.set_nonblocking(true)?;
@@ -86,7 +86,7 @@ fn serve(replies: Vec<String>) -> Result<(String, JoinHandle<Result<Vec<String>>
     Ok((base, server))
 }
 
-fn join(server: JoinHandle<Result<Vec<String>>>) -> Result<Vec<String>> {
+pub(super) fn join(server: JoinHandle<Result<Vec<String>>>) -> Result<Vec<String>> {
     server
         .join()
         .map_err(|_| eyre!("fixture server panicked"))?
@@ -216,13 +216,15 @@ async fn expired_codex_token_refreshes_before_usage_and_lists_resets_without_con
     auth.expires_at = Some(0);
     let usage = fetch_account_at(&client()?, &Provider::Codex, &mut auth, &base).await?;
     assert!(usage
-        .windows
+        .limits
+        .allowances
         .first()
-        .and_then(|metric| metric.used_percent)
+        .and_then(|allowance| allowance.credits.used_percent())
         .is_some_and(|percent| (percent - 13.0).abs() < f64::EPSILON));
-    assert_eq!(usage.credits.len(), 1);
+    assert_eq!(usage.limits.banked_resets.len(), 1);
     assert!(usage
-        .credits
+        .limits
+        .banked_resets
         .first()
         .is_some_and(|credit| credit.expires_at.is_some()));
     let requests = join(server)?;
@@ -263,9 +265,10 @@ async fn antigravity_compatibility_fallback_preserves_project_and_refreshes_expi
     auth.expires_at = Some(0);
     let usage = fetch_account_at(&client()?, &Provider::Antigravity, &mut auth, &base).await?;
     assert!(usage
-        .windows
+        .limits
+        .allowances
         .first()
-        .and_then(|metric| metric.used_percent)
+        .and_then(|allowance| allowance.credits.used_percent())
         .is_some_and(|percent| (percent - 75.0).abs() < f64::EPSILON));
     assert_eq!(
         auth.refresh_token.as_deref(),
@@ -305,7 +308,7 @@ async fn openrouter_only_requests_account_credits_for_management_keys() -> Resul
         &base,
     )
     .await?;
-    assert!(usage.credits.is_empty());
+    assert!(usage.limits.balances.is_empty());
     assert_eq!(join(server)?.len(), 1);
     let (base, server) = serve(vec![
         response(200, &json!({"data":{"usage":0,"is_management_key":true}})),
@@ -319,10 +322,11 @@ async fn openrouter_only_requests_account_credits_for_management_keys() -> Resul
     )
     .await?;
     assert!(usage
-        .credits
+        .limits
+        .balances
         .first()
-        .is_some_and(|credit| credit.name == "Account-wide credits"
-            && (credit.balance - 75.0).abs() < f64::EPSILON));
+        .and_then(|balance| balance.credits.remaining())
+        .is_some_and(|remaining| (remaining.as_f64() - 75.0).abs() < f64::EPSILON));
     assert!(join(server)?
         .last()
         .is_some_and(|request| request.starts_with("GET /credits ")));
@@ -400,5 +404,40 @@ async fn redirects_and_untrusted_codex_destinations_never_receive_credentials() 
         super::normalize_base_url("https://chatgpt.com/")?,
         "https://chatgpt.com/backend-api"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_refresh_uses_exchange_and_preserves_rotation_on_usage_error() -> Result<()> {
+    let (base, server) = serve(vec![
+        response(401, &json!({})),
+        response(
+            200,
+            &json!({"accessToken":"synthetic-cursor-new","refreshToken":"synthetic-cursor-rotated"}),
+        ),
+        response(503, &json!({"private":"not echoed"})),
+    ])?;
+    let mut auth = auth(CredentialKind::OAuth);
+    auth.refresh_token = Some("synthetic-cursor-refresh".to_owned());
+    let error = fetch_account_at(&client()?, &Provider::Cursor, &mut auth, &base)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("usage unexpectedly succeeded"))?;
+    assert!(!error.to_string().contains("synthetic"));
+    assert_eq!(auth.access_token, "synthetic-cursor-new");
+    assert_eq!(
+        auth.refresh_token.as_deref(),
+        Some("synthetic-cursor-rotated")
+    );
+    assert_eq!(auth.expires_at, None);
+    let requests = join(server)?;
+    let refresh = requests.get(1).ok_or_else(|| eyre!("missing refresh"))?;
+    assert!(refresh.starts_with("POST /auth/exchange_user_api_key "));
+    assert!(refresh.contains("Bearer synthetic-cursor-refresh"));
+    assert!(refresh.ends_with("{}"));
+    assert!(requests
+        .last()
+        .is_some_and(|request| request.starts_with("GET /auth/usage ")
+            && request.contains("Bearer synthetic-cursor-new")));
     Ok(())
 }

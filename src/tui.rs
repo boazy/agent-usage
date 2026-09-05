@@ -1,5 +1,7 @@
 use crate::dashboard::{AccountSnapshot, Dashboard};
-use crate::render::{color_enabled, layout_panes, style, PlacedPane};
+use crate::render::{
+    account_label, color_enabled, layout_panes, short_account_id, style, PlacedPane,
+};
 use crate::theme::{Theme, BUILTIN_THEMES};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -8,7 +10,9 @@ use eyre::{eyre, Result, WrapErr};
 use futures_util::StreamExt;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget,
+};
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal};
 use std::sync::Arc;
@@ -32,12 +36,14 @@ enum Mode {
         kind: PickerKind,
         selected: usize,
         offset: usize,
+        query: String,
     },
 }
 
 struct Choice {
     label: String,
     value: Option<String>,
+    search: String,
 }
 
 pub(crate) struct DashboardView {
@@ -95,14 +101,7 @@ impl DashboardView {
                     .as_ref()
                     .is_none_or(|provider| provider == account.provider.id())
                     && self.account.as_ref().is_none_or(|id| id == &account.id)
-                    && (query.is_empty()
-                        || account.label.to_lowercase().contains(&query)
-                        || account
-                            .email
-                            .as_ref()
-                            .is_some_and(|email| email.to_lowercase().contains(&query))
-                        || account.provider.to_string().to_lowercase().contains(&query)
-                        || account.provider.id().contains(&query))
+                    && (query.is_empty() || matches_query(&account_search(account), &query))
             })
             .map(|(index, _)| index)
             .collect()
@@ -115,6 +114,7 @@ impl DashboardView {
             width,
             self.theme,
             self.color,
+            self.account.is_some() || !self.filter.trim().is_empty() || self.provider.is_some(),
         )
     }
 
@@ -165,13 +165,14 @@ impl DashboardView {
         self.status = format!("Updated {count} account(s); {failures} unavailable");
     }
 
-    fn choices(&self, kind: PickerKind) -> Vec<Choice> {
+    fn choices(&self, kind: PickerKind, query: &str) -> Vec<Choice> {
         let mut choices = Vec::new();
         match kind {
             PickerKind::Provider => {
                 choices.push(Choice {
-                    label: "All providers".to_owned(),
+                    label: "All providers · clear selection and filter".to_owned(),
                     value: None,
+                    search: String::new(),
                 });
                 let providers: BTreeSet<_> = self
                     .snapshots
@@ -180,13 +181,15 @@ impl DashboardView {
                     .collect();
                 choices.extend(providers.into_iter().map(|provider| Choice {
                     label: crate::dashboard::Provider::from_id(&provider).to_string(),
+                    search: provider.to_lowercase(),
                     value: Some(provider),
                 }));
             }
             PickerKind::Account => {
                 choices.push(Choice {
-                    label: "All accounts".to_owned(),
+                    label: "All accounts · clear selection and filter".to_owned(),
                     value: None,
+                    search: String::new(),
                 });
                 choices.extend(
                     self.snapshots
@@ -198,13 +201,20 @@ impl DashboardView {
                         })
                         .map(|snapshot| {
                             let account = &snapshot.account;
-                            let short_id = account.account_id.as_deref().unwrap_or(&account.id);
+                            let label = account_label(account);
+                            let email = account
+                                .email
+                                .as_deref()
+                                .filter(|email| !label.contains(email))
+                                .map_or_else(String::new, |email| format!(" · {email}"));
                             Choice {
                                 label: format!(
-                                    "{} · {} · {}",
-                                    account.provider, account.label, short_id
+                                    "{} · {label}{email} · #{}",
+                                    account.provider,
+                                    short_account_id(account)
                                 ),
                                 value: Some(account.id.clone()),
+                                search: account_search(account),
                             }
                         }),
                 );
@@ -212,8 +222,11 @@ impl DashboardView {
             PickerKind::Theme => choices.extend(BUILTIN_THEMES.iter().map(|theme| Choice {
                 label: theme.name.to_owned(),
                 value: Some(theme.name.to_owned()),
+                search: theme.name.to_owned(),
             })),
         }
+        let query = query.to_lowercase();
+        choices.retain(|choice| choice.value.is_none() || matches_query(&choice.search, &query));
         choices
     }
 
@@ -231,7 +244,7 @@ impl DashboardView {
             self.theme.name
         );
         frame.render_widget(
-            Paragraph::new(heading).style(style(self.theme.meter, self.color)),
+            Paragraph::new(heading).style(style(self.theme.title, self.color)),
             Rect::new(area.x, area.y, area.width, 1),
         );
         if area.height == 1 {
@@ -275,13 +288,13 @@ impl DashboardView {
         }
         let footer_y = area.bottom().saturating_sub(2);
         frame.render_widget(
-            Paragraph::new(self.status.as_str()).style(style(self.theme.reset, self.color)),
+            Paragraph::new(self.status.as_str()).style(style(self.theme.label, self.color)),
             Rect::new(area.x, footer_y, area.width, 1),
         );
-        let help = if matches!(self.mode, Mode::Filter) {
-            "Type filter (q is text) · Enter done · Esc/Ctrl-C quit"
-        } else {
-            "/ filter · p providers · a accounts · t theme · arrows/PgUp/PgDn scroll · r visible refresh · q/Esc quit"
+        let help = match self.mode {
+            Mode::Filter => "Type filter (q is text) · Enter done · Esc/Ctrl-C quit",
+            Mode::Picker { .. } => "Type to search (q is text) · arrows move · Enter select · Esc/Ctrl-C quit",
+            Mode::Browse => "/ filter · p providers · a accounts · t theme · arrows/PgUp/PgDn scroll · r visible refresh · q/Esc quit",
         };
         frame.render_widget(
             Paragraph::new(help).style(style(self.theme.window, self.color)),
@@ -295,11 +308,12 @@ impl DashboardView {
             kind,
             selected,
             offset,
-        } = self.mode
+            query,
+        } = &self.mode
         else {
             return;
         };
-        let choices = self.choices(kind);
+        let choices = self.choices(*kind, query);
         let width = area.width.saturating_sub(4).clamp(1, 90);
         let height = area
             .height
@@ -307,7 +321,7 @@ impl DashboardView {
             .min(
                 u16::try_from(choices.len())
                     .unwrap_or(u16::MAX)
-                    .saturating_add(2),
+                    .saturating_add(5),
             )
             .max(1);
         let popup = Rect::new(
@@ -318,22 +332,58 @@ impl DashboardView {
         );
         frame.render_widget(Clear, popup);
         let title = match kind {
-            PickerKind::Provider => " Providers · Enter select ",
-            PickerKind::Account => " Accounts · Enter select ",
-            PickerKind::Theme => " Themes · Enter select ",
+            PickerKind::Provider => " Providers ",
+            PickerKind::Account => " Accounts ",
+            PickerKind::Theme => " Themes ",
         };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1))
+            .border_style(style(self.theme.active_border, self.color))
+            .title(ratatui::text::Span::styled(
+                title,
+                style(self.theme.title, self.color),
+            ));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(format!("Search: {query}")).style(style(self.theme.account, self.color)),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
+        if inner.height < 2 {
+            return;
+        }
         let items: Vec<_> = choices
             .iter()
             .map(|choice| ListItem::new(choice.label.as_str()))
             .collect();
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_symbol("> ")
-            .highlight_style(style(self.theme.meter, self.color));
+            .highlight_style(style(self.theme.selection, self.color));
         let mut state = ListState::default()
-            .with_selected(Some(selected))
-            .with_offset(offset);
-        frame.render_stateful_widget(list, popup, &mut state);
+            .with_selected(Some(*selected))
+            .with_offset(*offset);
+        let list_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+        frame.render_stateful_widget(list, list_area, &mut state);
+        if choices.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matching themes").style(style(self.theme.unknown, self.color)),
+                list_area,
+            );
+        }
+        frame.render_widget(
+            Paragraph::new("Type to search · q is text · Enter select")
+                .style(style(self.theme.label, self.color)),
+            Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        );
         if let Mode::Picker { offset, .. } = &mut self.mode {
             *offset = state.offset();
         }
@@ -364,12 +414,15 @@ impl DashboardView {
             }
             return Action::None;
         }
-        if key.code == KeyCode::Char('q') {
-            return Action::Quit;
-        }
-        if let Mode::Picker { kind, selected, .. } = self.mode {
-            let choices = self.choices(kind);
-            let page = usize::from(area.height.saturating_sub(6).max(1));
+        if let Mode::Picker {
+            kind,
+            selected,
+            ref query,
+            ..
+        } = self.mode
+        {
+            let choices = self.choices(kind, query);
+            let page = usize::from(area.height.saturating_sub(9).max(1));
             let next = match key.code {
                 KeyCode::Down | KeyCode::Right => selected.saturating_add(1),
                 KeyCode::Up | KeyCode::Left => selected.saturating_sub(1),
@@ -385,6 +438,31 @@ impl DashboardView {
                     self.scroll = 0;
                     return Action::None;
                 }
+                KeyCode::Backspace => {
+                    if let Mode::Picker { query, .. } = &mut self.mode {
+                        query.pop();
+                    }
+                    self.reset_picker_selection(kind);
+                    return Action::None;
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Mode::Picker { query, .. } = &mut self.mode {
+                        query.clear();
+                    }
+                    self.reset_picker_selection(kind);
+                    return Action::None;
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Mode::Picker { query, .. } = &mut self.mode {
+                        query.push(character);
+                    }
+                    self.reset_picker_selection(kind);
+                    return Action::None;
+                }
                 _ => selected,
             }
             .min(choices.len().saturating_sub(1));
@@ -392,6 +470,13 @@ impl DashboardView {
                 *selected = next;
             }
             return Action::None;
+        }
+        self.browse_key(key, area)
+    }
+
+    fn browse_key(&mut self, key: KeyEvent, area: Rect) -> Action {
+        if key.code == KeyCode::Char('q') {
+            return Action::Quit;
         }
         let page = usize::from(Self::content_area(area).height.max(1));
         match key.code {
@@ -401,6 +486,7 @@ impl DashboardView {
                     kind: PickerKind::Provider,
                     selected: 0,
                     offset: 0,
+                    query: String::new(),
                 }
             }
             KeyCode::Char('a') => {
@@ -408,6 +494,7 @@ impl DashboardView {
                     kind: PickerKind::Account,
                     selected: 0,
                     offset: 0,
+                    query: String::new(),
                 }
             }
             KeyCode::Char('t') => {
@@ -415,6 +502,7 @@ impl DashboardView {
                     kind: PickerKind::Theme,
                     selected: 0,
                     offset: 0,
+                    query: String::new(),
                 }
             }
             KeyCode::Down | KeyCode::Right => self.scroll = self.scroll.saturating_add(1),
@@ -427,6 +515,25 @@ impl DashboardView {
             _ => {}
         }
         Action::None
+    }
+
+    fn reset_picker_selection(&mut self, kind: PickerKind) {
+        let Mode::Picker { query, .. } = &self.mode else {
+            return;
+        };
+        let choices = self.choices(kind, query);
+        let first_match = usize::from(
+            !query.is_empty()
+                && choices.first().is_some_and(|choice| choice.value.is_none())
+                && choices.len() > 1,
+        );
+        if let Mode::Picker {
+            selected, offset, ..
+        } = &mut self.mode
+        {
+            *selected = first_match;
+            *offset = 0;
+        }
     }
 
     fn apply_choice(&mut self, kind: PickerKind, choice: &Choice) {
@@ -451,6 +558,22 @@ impl DashboardView {
             }
         }
     }
+}
+
+fn account_search(account: &crate::dashboard::AccountInfo) -> String {
+    format!(
+        "{} {} {} {} {}",
+        account_label(account),
+        account.name.as_deref().unwrap_or(""),
+        account.email.as_deref().unwrap_or(""),
+        account.provider,
+        account.provider.id()
+    )
+    .to_lowercase()
+}
+
+fn matches_query(text: &str, query: &str) -> bool {
+    query.split_whitespace().all(|word| text.contains(word))
 }
 
 fn intersects(pane: &PlacedPane, scroll: usize, height: u16) -> bool {

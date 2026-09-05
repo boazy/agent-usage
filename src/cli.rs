@@ -24,7 +24,7 @@ pub(crate) struct Cli {
     #[arg(short = 'b', long)]
     pub(crate) base_url: Option<String>,
 
-    /// Override the progress bar theme (e.g. default, solarized-dark, monokai, molokai).
+    /// Choose the report and dashboard palette (e.g. default, kanagawa, rose-pine).
     #[arg(long)]
     pub(crate) theme: Option<String>,
 

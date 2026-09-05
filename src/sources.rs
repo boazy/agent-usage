@@ -952,6 +952,7 @@ mod tests {
     };
     use crate::config::{SourceConfig, SourceKind};
     use crate::dashboard::{CredentialKind, Provider};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use eyre::{eyre, Result};
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -1426,6 +1427,62 @@ mod tests {
             serde_json::from_str::<Value>(&raw)?["access"],
             "wal-refresh"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_omp_json_and_database_map_real_oauth_keys_and_persist_rotation() -> Result<()> {
+        let (directory, connection) = database_fixture(true)?;
+        let token = format!(
+            "header.{}.signature",
+            URL_SAFE_NO_PAD
+                .encode(json!({"sub":"auth0|user_fixture","exp":4_070_908_800_u64}).to_string())
+        );
+        let value = json!({"access":token,"refresh":"synthetic-cursor-refresh",
+            "expires":4_070_908_800_000_u64,"apiEndpoint":"https://untrusted.example.invalid",
+            "unrelated":{"keep":true}});
+        connection.execute(
+            "INSERT INTO auth_credentials VALUES (1, 'cursor', 'oauth', ?1, NULL, NULL, 'keep-column')",
+            params![value.to_string()],
+        )?;
+        let json_path = directory.path().join("cursor.json");
+        let mut json_entry = value.clone();
+        json_entry["type"] = json!("oauth");
+        write_json(&json_path, &json!({"cursor":json_entry}))?;
+        for path in [json_path, directory.path().join("agent.db")] {
+            let mut discovery = discover_source(&source(&path, SourceKind::Omp))?;
+            let credential = discovery
+                .credentials
+                .first_mut()
+                .ok_or_else(|| eyre!("Cursor credential not discovered"))?;
+            assert_eq!(credential.provider, Provider::Cursor);
+            assert_eq!(credential.auth.subject.as_deref(), Some("user_fixture"));
+            assert_eq!(credential.auth.kind, CredentialKind::OAuth);
+            let prior = credential.auth.clone();
+            credential.auth.access_token = "synthetic-cursor-rotated".to_owned();
+            credential.auth.refresh_token = Some("synthetic-refresh-rotated".to_owned());
+            let _guard = acquire_refresh_guard(&credential.origin, Duration::from_secs(30))?;
+            persist_refreshed(&mut credential.origin, &prior, &credential.auth)?;
+            let reloaded = discover_source(&source(&path, SourceKind::Omp))?;
+            let auth = &reloaded
+                .credentials
+                .first()
+                .ok_or_else(|| eyre!("Cursor credential not rediscovered"))?
+                .auth;
+            assert_eq!(auth.access_token, "synthetic-cursor-rotated");
+            assert_eq!(
+                auth.refresh_token.as_deref(),
+                Some("synthetic-refresh-rotated")
+            );
+        }
+        let raw: String = connection.query_row(
+            "SELECT data FROM auth_credentials WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let retained: Value = serde_json::from_str(&raw)?;
+        assert_eq!(retained["unrelated"], json!({"keep":true}));
+        assert_eq!(retained["apiEndpoint"], "https://untrusted.example.invalid");
         Ok(())
     }
 }

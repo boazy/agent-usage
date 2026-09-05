@@ -15,9 +15,42 @@ cargo build --release
 ./target/release/agent-usage --config ./config.toml --theme solarized-dark
 ```
 
-Reports fit as many 44-column panes as the output width allows, then continue onto additional rows. Narrow terminals use one pane. Piped reports default to 100 columns, contain no cursor-drawing commands, and have no terminal-height limit. `--no-progress` suppresses progress messages; the report gauges remain visible.
+Reports fit as many 44-column panes as the output width allows, then continue onto additional rows. Each pane has a one-cell inset around its content; wrapping and scrolling include that padding. Narrow terminals use one pane. Piped reports default to 100 columns, contain no cursor-drawing commands, and have no terminal-height limit. `--no-progress` suppresses progress messages; the report gauges remain visible.
 
 `--json` emits normalized account metadata and usage, not raw provider responses or credentials. Timestamps are Unix epoch milliseconds. Source warnings are written to stderr.
+
+## Normalized usage model
+
+Every provider returns `usage.plan` and `usage.limits`. The `limits` object contains:
+
+| Field | Meaning |
+| --- | --- |
+| `allowances` | Named usage allowances with an optional window, reset timestamp, and typed credits |
+| `balances` | Named credit balances with optional expiry timestamps |
+| `banked_resets` | Saved resets with an optional count and expiry; a count-only aggregate stays one entry |
+| `global_reset_at` | Optional subscription-wide reset timestamp |
+
+Each allowance separates its `title` from its `window`. Its `credits.count` records either allocated and consumed amounts together (`full`), only the allocation (`allocated`), only remaining or consumed amounts, or `unknown`. Amounts retain integer or decimal representation. `credits.unit` distinguishes currencies, generic credits, percentages, and unknown units.
+
+For example, a USD allowance with 25.5 consumed out of 100 has this credits object:
+
+```json
+{
+  "count": {
+    "full": {
+      "allocated": { "integer": 100 },
+      "consumed": { "decimal": 25.5 }
+    }
+  },
+  "unit": { "currency": "usd" }
+}
+```
+
+Percentages are derived only when allocation and consumption are both known. A remaining-only amount never implies an allocation of 100. Unknown counts differ from zero; overdrawn balances retain negative remaining amounts. Banked resets share one heading and occupy one line per entry, including entries without a known expiry. Long reset titles are shortened to preserve the expiry.
+
+This JSON schema replaces the previous `usage.windows`, flat `usage.credits`, and redundant `used_percent` fields; those aliases are not emitted. Remote reset and expiry timestamps remain Unix epoch milliseconds.
+
+Internally, `Millis` preserves that Unix-millisecond representation. `chrono` parses RFC3339 timestamps and calculates calendar-month resets; a monotonic `Instant` is not used for remote timestamps.
 
 ## Providers and credential support
 
@@ -29,6 +62,7 @@ Providers represent separate billing systems. Claude models accessed through Ant
 | Claude | OAuth | Subscription windows, scoped limits, and available extra-usage spending limits |
 | OpenRouter | API key | Key spending, key budget and remaining budget; management keys can also report account-wide credits |
 | Antigravity | OAuth with a stored project ID | Shared quota groups and windows; compatible older endpoints can supply model-level quota data |
+| Cursor | OMP OAuth session, or stored API-key bearer for legacy usage only | Subscription allowances, on-demand spending, and reset dates; OAuth sessions can also supply membership plan and verified profile name/email |
 
 Codex and ordinary Claude API keys do not expose the subscription-usage endpoints used here. OpenRouter OAuth credentials and Antigravity API keys are also unsupported. These credentials are still discovered and displayed as unavailable. Unknown providers receive their own unavailable account panes. Missing or unrecognized quota amounts stay unknown; they are never replaced with fabricated usage.
 
@@ -70,6 +104,8 @@ Source names must be unique. `enabled` defaults to `true`; `optional` defaults t
 
 Accounts have opaque, provider-scoped IDs independent of their display labels. OAuth identity includes available user and organization/project information, so separate subscriptions stay separate. API keys are grouped by provider and a cryptographic fingerprint of the complete key, never by their displayed mask. Duplicate accounts retain all included source names. A refresh is saved only to the credential record that supplied the chosen grant.
 
+Overview reports and account pickers hide UUIDs, long numeric IDs, and similar opaque account identifiers. A short stable discriminator distinguishes picker entries without exposing the full ID. The TUI reveals a full account ID only when an explicit selection or filter leaves one account. A report containing one account is still an overview. Human-readable workspace names remain visible, and `--json` retains account IDs for configuration and automation. Anonymous OAuth accounts use stable numbered labels rather than an opaque ID; verified names appear separately when they differ from the title.
+
 ## Configuration and exclusions
 
 Copy [config.example.toml](config.example.toml) to `~/.config/agent-usage/config.toml`, or use `--config PATH`. `XDG_CONFIG_HOME` overrides the configuration directory on macOS and Linux. An explicitly requested missing config file is an error; it never falls back to automatic credential discovery.
@@ -104,22 +140,33 @@ Key masks reveal at most the first four and last four characters. Short or malfo
 
 | Key | Action |
 | --- | --- |
-| `/` | Edit a live filter over account label, email, or provider |
+| `/` | Edit a live filter over account label, name, email, or provider |
 | Enter | Finish filtering or select a picker item |
-| `p` | Choose a provider, including All |
-| `a` | Choose an account from the current provider selection, including All |
-| `t` | Choose a built-in theme for this session |
+| `p` | Search and choose a provider, including All |
+| `a` | Search and choose an account from the current provider selection, including All |
+| `t` | Search and choose a built-in theme for this session |
 | Arrows | Scroll the dashboard or move within a picker |
 | Page Up / Page Down | Scroll by a screen or picker page |
 | Home / End | Jump to the first or last row/item |
 | `r` | Refresh only account panes intersecting the current screen |
-| `q`, Escape, Ctrl-C | Quit; `q` is ordinary text while editing the filter |
+| Backspace / Ctrl-U | Remove a character / clear the search in a picker |
+| `q`, Escape, Ctrl-C | Quit; `q` is literal search text in the live filter and all pickers |
 
-An empty filter restores the unfiltered set. Choosing a provider or account clears the previous text filter. Resizing recomputes pane widths and visibility. Initial usage fetching runs in the background, so loading panes and controls remain responsive. Later automatic refreshes use the visible set at `refresh_seconds` intervals. Off-screen snapshots remain unchanged until refreshed.
+Pickers filter as you type, case-insensitively. The account picker matches names, email addresses, and provider names; the provider and theme pickers match their names. Space-separated search terms must all match. Arrows and paging move through the filtered results. Provider and account pickers keep All available even when nothing matches; Home then Enter selects it and clears the prior selection and text filter. Escape and Ctrl-C quit rather than dismissing a picker.
+
+An empty live filter restores the unfiltered set. Choosing a provider or account clears the previous text filter. Resizing recomputes pane widths and visibility. Initial usage fetching runs in the background, so loading panes and controls remain responsive. Later automatic refreshes use the visible set at `refresh_seconds` intervals. Off-screen snapshots remain unchanged until refreshed.
 
 Quitting restores the screen immediately and stops queued fetches. Already active requests finish within the configured timeout, followed by bounded credential persistence, so a rotated refresh token is not discarded. Repeated `r` presses do not accumulate refresh jobs. Terminal cleanup also runs on returned errors and unwinding panics.
 
-All built-in themes retain the same primary/muted gauge-color pair at every usage level. Color policy is delegated to `anstream`, including terminal detection and its `NO_COLOR`, `TERM`, and forced-color handling. Monochrome output still distinguishes gauge levels by glyph.
+## Themes and visual hierarchy
+
+All 22 built-in themes use semantic color roles for pane borders, active picker borders, titles, metadata labels and values, allowance windows, and reset times. `Sources`, `Plan`, and `Account` values have distinct palette hues. Window names appear in muted chromatic italics inside parentheses; reset labels such as “resets in” are styled separately from their durations. Bold titles and allowance names establish hierarchy, while picker selections add an underline.
+
+The role separation takes inspiration from [Yazi's structural, picker, and input theme roles](https://github.com/sxyazi/yazi/blob/main/yazi-config/preset/theme-dark.toml). Colors are explicit RGB palette values in typed `anstyle` styles, not copied terminal ANSI slots.
+
+Available themes: `default`, `solarized-dark`, `solarized-light`, `monokai`, `molokai`, `dracula`, `gruvbox-dark`, `gruvbox-light`, `one-dark`, `one-light`, `nord`, `github-dark`, `github-light`, `nord-dark`, `catppuccin-mocha`, `tokyo-night`, `everforest`, `kanagawa`, `rose-pine`, `rose-pine-dawn`, `ayu-dark`, and `catppuccin-latte`.
+
+All themes retain the same primary/muted gauge-color pair at every usage level; the original 16 themes preserve their existing gauge colors. Color policy is delegated to `anstream`, including terminal detection and its `NO_COLOR`, `TERM`, and forced-color handling. Monochrome output still distinguishes gauge levels by glyph.
 
 ## Credential safety and concurrency limits
 
@@ -149,3 +196,6 @@ Regression tests use generated credential files, temporary SQLite databases, and
 - [Antigravity usage adapter](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/usage/google-antigravity.ts)
 - [OpenRouter current-key API](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key)
 - [OpenRouter account-credit API](https://openrouter.ai/docs/api/api-reference/credits/get-remaining-credits)
+- [Cursor usage and endpoint contracts in OMP](https://github.com/can1357/oh-my-pi/blob/5964a0f7649275bcde818f20073193fd032451f2/packages/ai/src/usage/cursor.ts)
+- [Cursor session exchange in OMP](https://github.com/can1357/oh-my-pi/blob/5964a0f7649275bcde818f20073193fd032451f2/packages/ai/src/registry/oauth/cursor.ts)
+- [Cursor profile and membership metadata in CodexBar](https://github.com/steipete/CodexBar/blob/cd5f2be234330319fd67b566f3527b98d26b0ab7/Sources/CodexBarCore/Providers/Cursor/CursorStatusProbe.swift)

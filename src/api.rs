@@ -1,5 +1,8 @@
-use crate::auth::{apply_refresh_payload, AuthRecord};
-use crate::dashboard::{AccountUsage, CredentialKind, Provider, UsageMetric};
+use crate::auth::{apply_refresh_payload, token_expiry, AuthRecord};
+use crate::dashboard::{
+    AccountUsage, AllowanceWindow, CredentialKind, CreditAmount, CreditCount, CreditUnit, Provider,
+    UsageAllowance, UsageCredits,
+};
 use crate::time::{now_millis, parse_timestamp_to_ms, Millis};
 use eyre::{eyre, Result};
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -12,6 +15,7 @@ use url::Url;
 mod antigravity;
 mod claude;
 mod codex;
+mod cursor;
 mod openrouter;
 
 #[cfg(test)]
@@ -37,6 +41,9 @@ struct Endpoints<'a> {
     claude: &'a str,
     openrouter: &'a str,
     antigravity: &'a str,
+    cursor_api: &'a str,
+    cursor_web: &'a str,
+    cursor_token: &'a str,
     codex_token: &'a str,
     claude_token: &'a str,
     antigravity_token: &'a str,
@@ -49,6 +56,9 @@ impl<'a> Endpoints<'a> {
             claude: "https://api.anthropic.com/api/oauth/usage",
             openrouter: "https://openrouter.ai/api/v1",
             antigravity: "https://daily-cloudcode-pa.googleapis.com",
+            cursor_api: "https://api2.cursor.sh",
+            cursor_web: "https://cursor.com",
+            cursor_token: "https://api2.cursor.sh/auth/exchange_user_api_key",
             codex_token: "https://auth.openai.com/oauth/token",
             claude_token: "https://api.anthropic.com/v1/oauth/token",
             antigravity_token: "https://oauth2.googleapis.com/token",
@@ -95,7 +105,8 @@ pub(crate) fn normalize_base_url(input: &str) -> Result<String> {
 fn ensure_supported(provider: &Provider, auth: &AuthRecord) -> Result<()> {
     match (provider, auth.kind) {
         (Provider::Codex | Provider::Claude | Provider::Antigravity, CredentialKind::OAuth)
-        | (Provider::OpenRouter, CredentialKind::ApiKey) => {}
+        | (Provider::OpenRouter, CredentialKind::ApiKey)
+        | (Provider::Cursor, _) => {}
         (Provider::Codex, CredentialKind::ApiKey) => {
             return Err(eyre!(
                 "unsupported: Codex API keys do not expose subscription usage"
@@ -143,11 +154,15 @@ pub(crate) async fn fetch_account_at(
 ) -> Result<AccountUsage> {
     let claude = format!("{base_url}/api/oauth/usage");
     let token = format!("{base_url}/oauth/token");
+    let cursor_token = format!("{base_url}/auth/exchange_user_api_key");
     let endpoints = Endpoints {
         codex: base_url,
         claude: &claude,
         openrouter: base_url,
         antigravity: base_url,
+        cursor_api: base_url,
+        cursor_web: base_url,
+        cursor_token: &cursor_token,
         codex_token: &token,
         claude_token: &token,
         antigravity_token: &token,
@@ -192,7 +207,7 @@ async fn fetch_with_endpoints(
 async fn fetch_once(
     client: &Client,
     provider: &Provider,
-    auth: &AuthRecord,
+    auth: &mut AuthRecord,
     endpoints: &Endpoints<'_>,
 ) -> std::result::Result<AccountUsage, HttpError> {
     match provider {
@@ -200,6 +215,9 @@ async fn fetch_once(
         Provider::Claude => claude::fetch(client, auth, endpoints.claude).await,
         Provider::OpenRouter => openrouter::fetch(client, auth, endpoints.openrouter).await,
         Provider::Antigravity => antigravity::fetch(client, auth, endpoints.antigravity).await,
+        Provider::Cursor => {
+            cursor::fetch(client, auth, endpoints.cursor_api, endpoints.cursor_web).await
+        }
         Provider::Other(_) => Err(HttpError::InvalidPayload),
     }
 }
@@ -242,6 +260,15 @@ async fn refresh(
             ("client_id", ANTIGRAVITY_CLIENT_ID),
             ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
         ]),
+        Provider::Cursor => {
+            let mut bearer = HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|_| eyre!("invalid OAuth refresh credential"))?;
+            bearer.set_sensitive(true);
+            client
+                .post(endpoints.cursor_token)
+                .header(AUTHORIZATION, bearer)
+                .json(&json!({}))
+        }
         Provider::OpenRouter | Provider::Other(_) => {
             return Err(eyre!("unsupported OAuth refresh provider"))
         }
@@ -249,7 +276,12 @@ async fn refresh(
     let payload = request_json(request)
         .await
         .map_err(|error| eyre!("OAuth refresh: {error}"))?;
-    let access = text(&payload, "access_token")
+    let access_key = if *provider == Provider::Cursor {
+        "accessToken"
+    } else {
+        "access_token"
+    };
+    let access = text(&payload, access_key)
         .filter(|value| *value != "__remote__")
         .ok_or_else(|| eyre!("OAuth refresh returned no usable access token"))?;
     if *provider == Provider::Codex {
@@ -257,8 +289,12 @@ async fn refresh(
             .map_err(|_| eyre!("OAuth refresh returned incomplete credentials"))?;
     } else {
         access.clone_into(&mut auth.access_token);
-        if let Some(token) = text(&payload, "refresh_token").filter(|value| *value != "__remote__")
-        {
+        let refresh_key = if *provider == Provider::Cursor {
+            "refreshToken"
+        } else {
+            "refresh_token"
+        };
+        if let Some(token) = text(&payload, refresh_key).filter(|value| *value != "__remote__") {
             auth.refresh_token = Some(token.to_owned());
         }
         if let Some(token) = text(&payload, "id_token") {
@@ -266,11 +302,16 @@ async fn refresh(
         }
     }
     // Do not retain the expired timestamp when a refresh omits its lifetime.
-    auth.expires_at = payload
-        .get("expires_in")
-        .and_then(integer)
-        .filter(|seconds| *seconds >= 0)
-        .and_then(|seconds| now_ms()?.checked_add(seconds.checked_mul(1_000)?));
+    auth.expires_at = if *provider == Provider::Cursor {
+        token_expiry(&auth.access_token)
+    } else {
+        payload
+            .get("expires_in")
+            .and_then(integer)
+            .filter(|seconds| *seconds >= 0)
+            .and_then(|seconds| now_ms()?.checked_add(seconds.checked_mul(1_000)?))
+    };
+    auth.enrich_from_tokens(provider);
     Ok(())
 }
 
@@ -366,8 +407,8 @@ fn millis(value: Millis) -> Option<i64> {
     i64::try_from(value.get()).ok()
 }
 
-fn timestamp(value: &Value) -> Option<i64> {
-    parse_timestamp_to_ms(value).and_then(millis)
+fn timestamp(value: &Value) -> Option<Millis> {
+    parse_timestamp_to_ms(value)
 }
 
 fn number(value: &Value) -> Option<f64> {
@@ -381,6 +422,18 @@ fn nonnegative(value: &Value) -> Option<f64> {
     number(value).filter(|number| *number >= 0.0)
 }
 
+fn amount(value: &Value) -> Option<CreditAmount> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.parse::<u64>().ok())
+        .map(CreditAmount::Integer)
+        .or_else(|| number(value).map(CreditAmount::Decimal))
+}
+
+fn nonnegative_amount(value: &Value) -> Option<CreditAmount> {
+    amount(value).filter(|amount| amount.as_f64() >= 0.0)
+}
+
 fn integer(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_str()?.parse().ok())
 }
@@ -392,31 +445,49 @@ fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|text| !text.trim().is_empty())
 }
 
-fn percent_metric(name: String, percent: Option<f64>, resets_at: Option<i64>) -> UsageMetric {
-    let percent = percent
-        .filter(|number| number.is_finite())
-        .map(|number| number.clamp(0.0, 100.0));
-    UsageMetric {
-        name,
-        used_percent: percent,
-        used: percent,
-        limit: percent.map(|_| 100.0),
-        unit: Some("percent".to_owned()),
+fn percent_allowance(
+    title: String,
+    window: Option<AllowanceWindow>,
+    percent: Option<f64>,
+    resets_at: Option<Millis>,
+) -> UsageAllowance {
+    let count = percent
+        .filter(|percent| percent.is_finite() && *percent >= 0.0)
+        .map_or(CreditCount::Unknown, |consumed| CreditCount::Full {
+            allocated: CreditAmount::Integer(100),
+            consumed: CreditAmount::Decimal(consumed),
+        });
+    UsageAllowance {
+        title,
+        window,
         resets_at,
+        credits: UsageCredits {
+            count,
+            unit: CreditUnit::Percentage,
+        },
     }
 }
 
-fn spending_metric(name: String, used: Option<f64>, limit: Option<f64>, unit: &str) -> UsageMetric {
-    UsageMetric {
-        name,
-        used_percent: used
-            .zip(limit)
-            .filter(|(_, limit)| *limit > 0.0)
-            .map(|(used, limit)| used / limit * 100.0)
-            .filter(|value| value.is_finite()),
-        used,
-        limit,
-        unit: Some(unit.to_owned()),
+fn spending_allowance(
+    title: String,
+    window: Option<AllowanceWindow>,
+    used: Option<CreditAmount>,
+    limit: Option<CreditAmount>,
+    unit: CreditUnit,
+) -> UsageAllowance {
+    let count = match (limit, used) {
+        (Some(allocated), Some(consumed)) => CreditCount::Full {
+            allocated,
+            consumed,
+        },
+        (Some(allocated), None) => CreditCount::Allocated(allocated),
+        (_, Some(consumed)) => CreditCount::Consumed(consumed),
+        _ => CreditCount::Unknown,
+    };
+    UsageAllowance {
+        title,
+        window,
         resets_at: None,
+        credits: UsageCredits { count, unit },
     }
 }
