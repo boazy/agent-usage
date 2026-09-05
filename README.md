@@ -1,8 +1,12 @@
 # Agent Usage
 
-A Rust dashboard for usage limits and balances across coding-agent accounts. It imports stored credentials from Codex and Oh My Pi (OMP), groups duplicate accounts, and queries each supported billing provider concurrently.
+A Rust dashboard for usage limits and balances across coding-agent accounts. It
+imports stored credentials from Codex and Oh My Pi (OMP), groups duplicate
+accounts, and queries each supported billing provider concurrently.
 
-The default command prints an ordinary, vertically unbounded report. `--tui` opens the interactive dashboard. Both views use the same account panes, built-in themes, and four-level `█▓▒░` gauges.
+The default command prints an ordinary, vertically unbounded report. `--tui`
+opens the interactive dashboard. Both views use the same account panes, built-in
+themes, and four-level `█▓▒░` gauges.
 
 ## Build and run
 
@@ -15,9 +19,16 @@ cargo build --release
 ./target/release/agent-usage --config ./config.toml --theme solarized-dark
 ```
 
-Reports fit as many 44-column panes as the output width allows, then continue onto additional rows. Each pane has a one-cell inset around its content; wrapping and scrolling include that padding. Narrow terminals use one pane. Piped reports default to 100 columns, contain no cursor-drawing commands, and have no terminal-height limit. `--no-progress` suppresses progress messages; the report gauges remain visible.
+Reports fit as many 44-column panes as the output width allows, then continue
+onto additional rows. Each pane has a one-cell inset around its content;
+wrapping and scrolling include that padding. Narrow terminals use one pane.
+Piped reports default to 100 columns, contain no cursor-drawing commands, and
+have no terminal-height limit. `--no-progress` suppresses progress messages; the
+report gauges remain visible.
 
-`--json` emits normalized account metadata and usage, not raw provider responses or credentials. Timestamps are Unix epoch milliseconds. Source warnings are written to stderr.
+`--json` emits normalized account metadata and usage, not raw provider responses
+or credentials. Timestamps are Unix epoch milliseconds. Source warnings are
+written to stderr.
 
 ## Normalized usage model
 
@@ -30,7 +41,11 @@ Every provider returns `usage.plan` and `usage.limits`. The `limits` object cont
 | `banked_resets` | Saved resets with an optional count and expiry; a count-only aggregate stays one entry |
 | `global_reset_at` | Optional subscription-wide reset timestamp |
 
-Each allowance separates its `title` from its `window`. Its `credits.count` records either allocated and consumed amounts together (`full`), only the allocation (`allocated`), only remaining or consumed amounts, or `unknown`. Amounts retain integer or decimal representation. `credits.unit` distinguishes currencies, generic credits, percentages, and unknown units.
+Each allowance separates its `title` from its `window`. Its `credits.count`
+records either allocated and consumed amounts together (`full`), only the
+allocation (`allocated`), only remaining or consumed amounts, or `unknown`.
+Amounts retain integer or decimal representation. `credits.unit` distinguishes
+currencies, generic credits, percentages, and unknown units.
 
 For example, a USD allowance with 25.5 consumed out of 100 has this credits object:
 
@@ -46,15 +61,25 @@ For example, a USD allowance with 25.5 consumed out of 100 has this credits obje
 }
 ```
 
-Percentages are derived only when allocation and consumption are both known. A remaining-only amount never implies an allocation of 100. Unknown counts differ from zero; overdrawn balances retain negative remaining amounts. Banked resets share one heading and occupy one line per entry, including entries without a known expiry. Long reset titles are shortened to preserve the expiry.
+Percentages are derived only when allocation and consumption are both known. A
+remaining-only amount never implies an allocation of 100. Unknown counts differ
+from zero; overdrawn balances retain negative remaining amounts. Banked resets
+share one heading and occupy one line per entry, including entries without a
+known expiry. Long reset titles are shortened to preserve the expiry.
 
-This JSON schema replaces the previous `usage.windows`, flat `usage.credits`, and redundant `used_percent` fields; those aliases are not emitted. Remote reset and expiry timestamps remain Unix epoch milliseconds.
+This JSON schema replaces the previous `usage.windows`, flat `usage.credits`,
+and redundant `used_percent` fields; those aliases are not emitted. Remote reset
+and expiry timestamps remain Unix epoch milliseconds.
 
-Internally, `Millis` preserves that Unix-millisecond representation. `chrono` parses RFC3339 timestamps and calculates calendar-month resets; a monotonic `Instant` is not used for remote timestamps.
+Internally, `Millis` preserves that Unix-millisecond representation. `chrono`
+parses RFC3339 timestamps and calculates calendar-month resets; a monotonic
+`Instant` is not used for remote timestamps.
 
 ## Providers and credential support
 
-Providers represent separate billing systems. Claude models accessed through Antigravity remain part of the Antigravity account; they are not merged into a Claude subscription.
+Providers represent separate billing systems. Claude models accessed through
+Antigravity remain part of the Antigravity account; they are not merged into a
+Claude subscription.
 
 | Billing provider | Supported credential | Reported data |
 | --- | --- | --- |
@@ -64,20 +89,37 @@ Providers represent separate billing systems. Claude models accessed through Ant
 | Antigravity | OAuth with a stored project ID | Shared quota groups and windows; compatible older endpoints can supply model-level quota data |
 | Cursor | OMP OAuth session, or stored API-key bearer for legacy usage only | Subscription allowances, on-demand spending, and reset dates; OAuth sessions can also supply membership plan and verified profile name/email |
 
-Codex and ordinary Claude API keys do not expose the subscription-usage endpoints used here. OpenRouter OAuth credentials and Antigravity API keys are also unsupported. These credentials are still discovered and displayed as unavailable. Unknown providers receive their own unavailable account panes. Missing or unrecognized quota amounts stay unknown; they are never replaced with fabricated usage.
+Codex and ordinary Claude API keys do not expose the subscription-usage
+endpoints used here. OpenRouter OAuth credentials and Antigravity API keys are
+also unsupported. These credentials are still discovered and displayed as
+unavailable. Unknown providers receive their own unavailable account panes.
+Missing or unrecognized quota amounts stay unknown; they are never replaced with
+fabricated usage.
 
-A failed account does not prevent other accounts from updating. Requests have an account-wide timeout, response bodies are size-limited, and redirects are disabled. Concurrency is bounded across overlapping refreshes.
+A failed account does not prevent other accounts from updating. Requests have an
+account-wide timeout, response bodies are size-limited, and redirects are
+disabled. Concurrency is bounded across overlapping refreshes.
 
 ## Credential sources
 
 Without an explicit source list, the dashboard discovers:
 
-- Codex: `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset.
-- OMP: the active OMP agent directory's `agent.db`. Legacy `auth.json` is a fallback only when that database is absent. An existing database remains authoritative even if it cannot be read; a stale legacy file is not merged into it.
+- Codex: `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is
+  unset.
+- OMP: the active OMP agent directory's `agent.db`. Legacy `auth.json` is a
+  fallback only when that database is absent. An existing database remains
+  authoritative even if it cannot be read; a stale legacy file is not merged
+  into it.
 
-OMP directory selection recognizes `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`, active `OMP_PROFILE`/`PI_PROFILE`, and applicable XDG data directories. Explicit source paths provide control over other installations and profiles.
+OMP directory selection recognizes `PI_CODING_AGENT_DIR`, `PI_CONFIG_DIR`,
+active `OMP_PROFILE`/`PI_PROFILE`, and applicable XDG data directories. Explicit
+source paths provide control over other installations and profiles.
 
-Codex sources understand `auth_mode`, OAuth `tokens`, and `OPENAI_API_KEY` precedence. OMP sources support the SQLite `auth_credentials` table and legacy JSON maps whose provider values are individual credentials or arrays. Disabled SQLite credentials are skipped. Discovery reads credential records only, not usage caches, conversation history, or logs.
+Codex sources understand `auth_mode`, OAuth `tokens`, and `OPENAI_API_KEY`
+precedence. OMP sources support the SQLite `auth_credentials` table and legacy
+JSON maps whose provider values are individual credentials or arrays. Disabled
+SQLite credentials are skipped. Discovery reads credential records only, not
+usage caches, conversation history, or logs.
 
 Configure additional sources to read multiple Codex installations or OMP stores:
 
@@ -100,17 +142,38 @@ path = "~/.omp/agent/agent.db"
 optional = true
 ```
 
-Source names must be unique. `enabled` defaults to `true`; `optional` defaults to `false`. An optional missing source is ignored. Other discovery failures produce warnings while remaining sources continue. Explicit sources replace automatic discovery. Set `sources = []` to disable discovery entirely.
+Source names must be unique. `enabled` defaults to `true`; `optional` defaults
+to `false`. An optional missing source is ignored. Other discovery failures
+produce warnings while remaining sources continue. Explicit sources replace
+automatic discovery. Set `sources = []` to disable discovery entirely.
 
-Accounts have opaque, provider-scoped IDs independent of their display labels. OAuth identity includes available user and organization/project information, so separate subscriptions stay separate. API keys are grouped by provider and a cryptographic fingerprint of the complete key, never by their displayed mask. Duplicate accounts retain all included source names. A refresh is saved only to the credential record that supplied the chosen grant.
+Accounts have opaque, provider-scoped IDs independent of their display labels.
+OAuth identity includes available user and organization/project information, so
+separate subscriptions stay separate. API keys are grouped by provider and a
+cryptographic fingerprint of the complete key, never by their displayed mask.
+Duplicate accounts retain all included source names. A refresh is saved only to
+the credential record that supplied the chosen grant.
 
-Overview reports and account pickers hide UUIDs, long numeric IDs, and similar opaque account identifiers. A short stable discriminator distinguishes picker entries without exposing the full ID. The TUI reveals a full account ID only when an explicit selection or filter leaves one account. A report containing one account is still an overview. Human-readable workspace names remain visible, and `--json` retains account IDs for configuration and automation. Anonymous OAuth accounts use stable numbered labels rather than an opaque ID; verified names appear separately when they differ from the title.
+Overview reports and account pickers hide UUIDs, long numeric IDs, and similar
+opaque account identifiers. A short stable discriminator distinguishes picker
+entries without exposing the full ID. The TUI reveals a full account ID only
+when an explicit selection or filter leaves one account. A report containing one
+account is still an overview. Human-readable workspace names remain visible, and
+`--json` retains account IDs for configuration and automation. Anonymous OAuth
+accounts use stable numbered labels rather than an opaque ID; verified names
+appear separately when they differ from the title.
 
 ## Configuration and exclusions
 
-Copy [config.example.toml](config.example.toml) to `~/.config/agent-usage/config.toml`, or use `--config PATH`. `XDG_CONFIG_HOME` overrides the configuration directory on macOS and Linux. An explicitly requested missing config file is an error; it never falls back to automatic credential discovery.
+Copy [config.example.toml](config.example.toml) to
+`~/.config/agent-usage/config.toml`, or use `--config PATH`. `XDG_CONFIG_HOME`
+overrides the configuration directory on macOS and Linux. An explicitly
+requested missing config file is an error; it never falls back to automatic
+credential discovery.
 
-Explicit CLI values override environment values, which override the config file. For example, `AGENT_USAGE_THEME=monokai` and `AGENT_USAGE_CONCURRENCY=3` remain available. Nested environment names use a double underscore.
+Explicit CLI values override environment values, which override the config file.
+For example, `AGENT_USAGE_THEME=monokai` and `AGENT_USAGE_CONCURRENCY=3` remain
+available. Nested environment names use a double underscore.
 
 ```toml
 [exclude]
@@ -127,14 +190,25 @@ provider = "claude"
 
 Exclusions are applied before any provider request:
 
-- `sources`: exclude an entire kind (`codex` or `omp`) or one configured source name. Kind exclusions cover custom names too, and run before discovery and deduplication.
-- `providers`: exclude a billing provider. OMP aliases such as `openai-codex`, `anthropic`, and `google-antigravity` are accepted.
+- `sources`: exclude an entire kind (`codex` or `omp`) or one configured source
+  name. Kind exclusions cover custom names too, and run before discovery and
+  deduplication.
+- `providers`: exclude a billing provider. OMP aliases such as `openai-codex`,
+  `anthropic`, and `google-antigravity` are accepted.
 - `emails`: exclude an email across all providers, case-insensitively.
 - `accounts`: exclude the conjunction of an email and provider.
-- `account_ids`: match a stored account/workspace ID or the opaque dashboard ID shown in JSON.
-- `api_keys`: match only visible parts of the displayed key mask. Patterns contain exactly one `*`, at most four characters on each side, and four to eight literal characters in total. Literals are ASCII letters, digits, `-`, or `_`. `*1234` and `sk-o*1234` are valid; complete keys and arbitrary secret substrings are rejected.
+- `account_ids`: match a stored account/workspace ID or the opaque dashboard ID
+  shown in JSON.
+- `api_keys`: match only visible parts of the displayed key mask. Patterns
+  contain exactly one `*`, at most four characters on each side, and four to
+  eight literal characters in total. Literals are ASCII letters, digits, `-`, or
+  `_`. `*1234` and `sk-o*1234` are valid; complete keys and arbitrary secret
+  substrings are rejected.
 
-Key masks reveal at most the first four and last four characters. Short or malformed keys are completely masked. Exclusion matches found in any included duplicate credential apply to the merged account, including email metadata absent from an earlier source.
+Key masks reveal at most the first four and last four characters. Short or
+malformed keys are completely masked. Exclusion matches found in any included
+duplicate credential apply to the merged account, including email metadata
+absent from an earlier source.
 
 ## Interactive controls
 
@@ -152,31 +226,82 @@ Key masks reveal at most the first four and last four characters. Short or malfo
 | Backspace / Ctrl-U | Remove a character / clear the search in a picker |
 | `q`, Escape, Ctrl-C | Quit; `q` is literal search text in the live filter and all pickers |
 
-Pickers filter as you type, case-insensitively. The account picker matches names, email addresses, and provider names; the provider and theme pickers match their names. Space-separated search terms must all match. Arrows and paging move through the filtered results. Provider and account pickers keep All available even when nothing matches; Home then Enter selects it and clears the prior selection and text filter. Escape and Ctrl-C quit rather than dismissing a picker.
+Pickers filter as you type, case-insensitively. The account picker matches
+names, email addresses, and provider names; the provider and theme pickers match
+their names. Space-separated search terms must all match. Arrows and paging move
+through the filtered results. Provider and account pickers keep All available
+even when nothing matches; Home then Enter selects it and clears the prior
+selection and text filter. Escape and Ctrl-C quit rather than dismissing a
+picker.
 
-An empty live filter restores the unfiltered set. Choosing a provider or account clears the previous text filter. Resizing recomputes pane widths and visibility. Initial usage fetching runs in the background, so loading panes and controls remain responsive. Later automatic refreshes use the visible set at `refresh_seconds` intervals. Off-screen snapshots remain unchanged until refreshed.
+An empty live filter restores the unfiltered set. Choosing a provider or account
+clears the previous text filter. Resizing recomputes pane widths and visibility.
+Initial usage fetching runs in the background, so loading panes and controls
+remain responsive. Later automatic refreshes use the visible set at
+`refresh_seconds` intervals. Off-screen snapshots remain unchanged until
+refreshed.
 
-Quitting restores the screen immediately and stops queued fetches. Already active requests finish within the configured timeout, followed by bounded credential persistence, so a rotated refresh token is not discarded. Repeated `r` presses do not accumulate refresh jobs. Terminal cleanup also runs on returned errors and unwinding panics.
+Quitting restores the screen immediately and stops queued fetches. Already
+active requests finish within the configured timeout, followed by bounded
+credential persistence, so a rotated refresh token is not discarded. Repeated
+`r` presses do not accumulate refresh jobs. Terminal cleanup also runs on
+returned errors and unwinding panics.
 
 ## Themes and visual hierarchy
 
-All 22 built-in themes use semantic color roles for pane borders, active picker borders, titles, metadata labels and values, allowance windows, and reset times. `Sources`, `Plan`, and `Account` values have distinct palette hues. Window names appear in muted chromatic italics inside parentheses; reset labels such as “resets in” are styled separately from their durations. Bold titles and allowance names establish hierarchy, while picker selections add an underline.
+All 22 built-in themes use semantic color roles for pane borders, active picker
+borders, titles, metadata labels and values, allowance windows, and reset times.
+`Sources`, `Plan`, and `Account` values have distinct palette hues. Window names
+appear in muted chromatic italics inside parentheses; reset labels such as
+“resets in” are styled separately from their durations. Bold titles and
+allowance names establish hierarchy, while picker selections add an underline.
 
-The role separation takes inspiration from [Yazi's structural, picker, and input theme roles](https://github.com/sxyazi/yazi/blob/main/yazi-config/preset/theme-dark.toml). Colors are explicit RGB palette values in typed `anstyle` styles, not copied terminal ANSI slots.
+The role separation takes inspiration from [Yazi's structural, picker, and input
+theme
+roles](https://github.com/sxyazi/yazi/blob/main/yazi-config/preset/theme-dark.toml).
+Colors are explicit RGB palette values in typed `anstyle` styles, not copied
+terminal ANSI slots.
 
-Available themes: `default`, `solarized-dark`, `solarized-light`, `monokai`, `molokai`, `dracula`, `gruvbox-dark`, `gruvbox-light`, `one-dark`, `one-light`, `nord`, `github-dark`, `github-light`, `nord-dark`, `catppuccin-mocha`, `tokyo-night`, `everforest`, `kanagawa`, `rose-pine`, `rose-pine-dawn`, `ayu-dark`, and `catppuccin-latte`.
+Available themes: `default`, `solarized-dark`, `solarized-light`, `monokai`,
+`molokai`, `dracula`, `gruvbox-dark`, `gruvbox-light`, `one-dark`, `one-light`,
+`nord`, `github-dark`, `github-light`, `nord-dark`, `catppuccin-mocha`,
+`tokyo-night`, `everforest`, `kanagawa`, `rose-pine`, `rose-pine-dawn`,
+`ayu-dark`, and `catppuccin-latte`.
 
-All themes retain the same primary/muted gauge-color pair at every usage level; the original 16 themes preserve their existing gauge colors. Color policy is delegated to `anstream`, including terminal detection and its `NO_COLOR`, `TERM`, and forced-color handling. Monochrome output still distinguishes gauge levels by glyph.
+All themes retain the same primary/muted gauge-color pair at every usage level;
+the original 16 themes preserve their existing gauge colors. Color policy is
+delegated to `anstream`, including terminal detection and its `NO_COLOR`,
+`TERM`, and forced-color handling. Monochrome output still distinguishes gauge
+levels by glyph.
 
 ## Credential safety and concurrency limits
 
-Credentials are never serialized into report objects and have no debug formatter. HTTP failures omit response bodies and secret-bearing request details. Refresh requests use fixed provider endpoints; the Codex base URL option accepts only official HTTPS ChatGPT origins. Usage operations do not redeem credits, run model completions, or change subscriptions.
+Credentials are never serialized into report objects and have no debug
+formatter. HTTP failures omit response bodies and secret-bearing request
+details. Refresh requests use fixed provider endpoints; the Codex base URL
+option accepts only official HTTPS ChatGPT origins. Usage operations do not
+redeem credits, run model completions, or change subscriptions.
 
-Refreshed credentials are written back to the exact originating JSON entry or SQLite row. Writes preserve unrelated data, compare against the expected credential, and use private file permissions. Existing owner-owned readable files with broader read permissions are accepted with a warning; discovery does not chmod them. Unsafe symlinks, foreign ownership, hardlinks, and other-user-writable credential files are rejected.
+Refreshed credentials are written back to the exact originating JSON entry or
+SQLite row. Writes preserve unrelated data, compare against the expected
+credential, and use private file permissions. Existing owner-owned readable
+files with broader read permissions are accepted with a warning; discovery does
+not chmod them. Unsafe symlinks, foreign ownership, hardlinks, and
+other-user-writable credential files are rejected.
 
-Current OMP SQLite stores coordinate refreshes through OMP's existing lease table and use conditional row updates. Older stores use advisory locks and conditional updates without creating a new lease schema. JSON writes use cooperative locks, a final content/inode check, a private temporary file, atomic replacement, and fsync. A separate program that ignores the JSON locks can still write in the final check-to-replacement interval; this limitation is reported during discovery. Older OMP versions without shared leases also cannot prevent simultaneous provider-side grant rotation by another program.
+Current OMP SQLite stores coordinate refreshes through OMP's existing lease
+table and use conditional row updates. Older stores use advisory locks and
+conditional updates without creating a new lease schema. JSON writes use
+cooperative locks, a final content/inode check, a private temporary file, atomic
+replacement, and fsync. A separate program that ignores the JSON locks can still
+write in the final check-to-replacement interval; this limitation is reported
+during discovery. Older OMP versions without shared leases also cannot prevent
+simultaneous provider-side grant rotation by another program.
 
-Broker refresh sentinels are never sent to OAuth endpoints. Refresh those grants through their owning tool. The dashboard does not add a credential broker, evaluate credential commands, or read secrets from unrelated configuration files.
+Broker refresh sentinels are never sent to OAuth endpoints. Refresh those grants
+through their owning tool. The dashboard does not add a credential broker,
+evaluate credential commands, or read secrets from unrelated configuration
+files.
 
 ## Development and API evidence
 
@@ -186,7 +311,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Regression tests use generated credential files, temporary SQLite databases, and localhost HTTP fixtures only. Provider contracts were researched from public source and official documentation; no live account requests were used for validation.
+Regression tests use generated credential files, temporary SQLite databases, and
+localhost HTTP fixtures only. Provider contracts were researched from public
+source and official documentation; no live account requests were used for
+validation.
 
 - [OMP credential storage and formats](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/auth/sqlite-credential-store.ts)
 - [OMP OAuth credential fields](https://github.com/can1357/oh-my-pi/blob/main/packages/ai/src/registry/oauth/types.ts)
