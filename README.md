@@ -273,6 +273,9 @@ appear in muted chromatic italics inside parentheses; reset labels such as
 “resets in” are styled separately from their durations. Bold titles and
 allowance names establish hierarchy, while picker selections add an underline.
 
+In `--tui` mode, each theme also paints the complete terminal canvas with its
+own background, including pane whitespace and picker overlays.
+
 The role separation takes inspiration from [Yazi's structural, picker, and input
 theme
 roles](https://github.com/sxyazi/yazi/blob/main/yazi-config/preset/theme-dark.toml).

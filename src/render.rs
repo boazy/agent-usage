@@ -29,7 +29,7 @@ impl AccountPane {
     pub(crate) fn new(
         snapshot: &AccountSnapshot,
         width: u16,
-        theme: Theme,
+        theme: &Theme,
         color: bool,
         show_account_id: bool,
     ) -> Self {
@@ -148,7 +148,7 @@ fn append_usage(
     lines: &mut Vec<Line<'static>>,
     usage: &AccountUsage,
     width: u16,
-    theme: Theme,
+    theme: &Theme,
     color: bool,
 ) {
     if let Some(plan) = &usage.plan {
@@ -217,7 +217,7 @@ fn append_allowance(
     lines: &mut Vec<Line<'static>>,
     allowance: &UsageAllowance,
     width: u16,
-    theme: Theme,
+    theme: &Theme,
     color: bool,
 ) {
     let mut heading = vec![Span::styled(
@@ -303,7 +303,7 @@ fn push_reset(
     verb: &str,
     at: Option<Millis>,
     width: u16,
-    theme: Theme,
+    theme: &Theme,
     color: bool,
 ) {
     let (label, value) = reset_text(verb, at);
@@ -332,7 +332,7 @@ fn append_banked_reset(
     lines: &mut Vec<Line<'static>>,
     reset: &BankedReset,
     width: u16,
-    theme: Theme,
+    theme: &Theme,
     color: bool,
 ) {
     let (label, value) = reset_text("expires", reset.expires_at);
@@ -488,7 +488,7 @@ pub(crate) fn layout_panes(
     snapshots: &[AccountSnapshot],
     indices: &[usize],
     width: u16,
-    theme: Theme,
+    theme: &Theme,
     color: bool,
     show_account_id: bool,
     reserved: Option<Rect>,
@@ -569,7 +569,7 @@ pub(crate) fn color_enabled() -> bool {
 pub(crate) fn render_report(
     snapshots: &[AccountSnapshot],
     width: u16,
-    theme: Theme,
+    theme: &Theme,
 ) -> io::Result<()> {
     let color = color_enabled();
     let indices: Vec<_> = (0..snapshots.len()).collect();
@@ -876,7 +876,7 @@ mod tests {
                     consumed: CreditAmount::Decimal(percent),
                 };
                 let mut lines = Vec::new();
-                super::append_allowance(&mut lines, &allowance, 40, *theme, true);
+                super::append_allowance(&mut lines, &allowance, 40, theme, true);
                 let bar = &lines[1];
                 for span in bar.spans.iter().filter(|span| !span.content.is_empty()) {
                     let expected = if span.content.contains('░') {
@@ -889,7 +889,7 @@ mod tests {
             }
             allowance.credits.count = CreditCount::Unknown;
             let mut lines = Vec::new();
-            super::append_allowance(&mut lines, &allowance, 40, *theme, false);
+            super::append_allowance(&mut lines, &allowance, 40, theme, false);
             assert!(!lines
                 .iter()
                 .any(|line| line.to_string().contains(['█', '▓', '▒', '░'])));
@@ -936,7 +936,7 @@ mod tests {
         let pane = super::AccountPane::new(
             snapshot,
             width,
-            crate::theme::BUILTIN_THEMES[0],
+            &crate::theme::BUILTIN_THEMES[0],
             color,
             details,
         );
@@ -1090,7 +1090,7 @@ mod tests {
             &snapshots,
             &indices,
             width,
-            crate::theme::BUILTIN_THEMES[0],
+            &crate::theme::BUILTIN_THEMES[0],
             false,
             false,
             None,
@@ -1132,7 +1132,7 @@ mod tests {
             &snapshots,
             &indices,
             88,
-            crate::theme::BUILTIN_THEMES[0],
+            &crate::theme::BUILTIN_THEMES[0],
             false,
             false,
             None,
@@ -1141,7 +1141,7 @@ mod tests {
             &snapshots,
             &indices,
             88,
-            crate::theme::BUILTIN_THEMES[0],
+            &crate::theme::BUILTIN_THEMES[0],
             false,
             false,
             Some(Rect::new(44, 0, 44, 100)),
@@ -1172,7 +1172,7 @@ mod tests {
             &snapshots,
             &indices,
             88,
-            crate::theme::BUILTIN_THEMES[0],
+            &crate::theme::BUILTIN_THEMES[0],
             false,
             false,
             None,

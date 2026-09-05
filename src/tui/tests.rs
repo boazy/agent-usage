@@ -3,6 +3,7 @@ use crate::dashboard::{
     AccountInfo, AccountSnapshot, AccountUsage, AllowanceWindow, CredentialKind, CreditAmount,
     CreditCount, CreditUnit, Provider, SubscriptionLimits, UsageAllowance, UsageCredits,
 };
+use crate::render::style;
 use crate::theme::BUILTIN_THEMES;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use eyre::Result;
@@ -159,6 +160,92 @@ fn tiny_and_resized_surfaces_stay_inside_the_buffer() -> Result<()> {
         assert_eq!(
             terminal.backend().buffer().area,
             Rect::new(0, 0, width, height)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn every_tui_cell_uses_the_selected_theme_background() -> Result<()> {
+    for &theme in BUILTIN_THEMES {
+        let mut view = view();
+        view.theme = theme;
+        view.color = true;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(90, 20))?;
+        let expected = style(theme.background, true).bg;
+
+        terminal.draw(|frame| view.draw(frame))?;
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.style().bg == expected),
+            "{} overview does not use its background everywhere",
+            theme.name
+        );
+
+        key(&mut view, KeyCode::Char('t'));
+        terminal.draw(|frame| view.draw(frame))?;
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.style().bg == expected),
+            "{} picker does not use its background everywhere",
+            theme.name
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn unselected_tui_text_uses_the_theme_foreground() -> Result<()> {
+    for &theme in BUILTIN_THEMES {
+        let expected = style(theme.label, true).fg;
+
+        let mut empty = view();
+        empty.theme = theme;
+        empty.color = true;
+        empty.filter = "not-an-account".to_owned();
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(90, 20))?;
+        terminal.draw(|frame| empty.draw(frame))?;
+        assert_eq!(terminal.backend().buffer()[(0, 2)].symbol(), "N");
+        assert_eq!(
+            terminal.backend().buffer()[(0, 2)].style().fg,
+            expected,
+            "{} empty-state foreground",
+            theme.name
+        );
+
+        let mut picker = view();
+        picker.theme = theme;
+        picker.color = true;
+        key(&mut picker, KeyCode::Char('t'));
+        terminal.draw(|frame| picker.draw(frame))?;
+        let buffer = terminal.backend().buffer();
+        let solarized = buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .skip(4)
+            .find_map(|row| {
+                row.windows("solarized-dark".len()).find(|cells| {
+                    cells
+                        .iter()
+                        .map(ratatui::buffer::Cell::symbol)
+                        .collect::<String>()
+                        == "solarized-dark"
+                })
+            })
+            .ok_or_else(|| eyre::eyre!("missing unselected picker row"))?;
+        assert_eq!(
+            solarized[0].style().fg,
+            expected,
+            "{} unselected picker foreground",
+            theme.name
         );
     }
     Ok(())

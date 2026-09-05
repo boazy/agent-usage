@@ -3,6 +3,7 @@ use anstyle::{Color, RgbColor, Style};
 #[derive(Clone, Copy)]
 pub(crate) struct Theme {
     pub(crate) name: &'static str,
+    pub(crate) background: Style,
     pub(crate) title: Style,
     pub(crate) border: Style,
     pub(crate) active_border: Style,
@@ -27,8 +28,14 @@ const fn rgb(hex: u32) -> Style {
     Style::new().fg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
 }
 
+const fn bg(hex: u32) -> Style {
+    let [_, red, green, blue] = hex.to_be_bytes();
+    Style::new().bg_color(Some(Color::Rgb(RgbColor(red, green, blue))))
+}
+
 #[derive(Clone, Copy)]
 struct Palette {
+    background: u32,
     accent: u32,
     secondary: u32,
     tertiary: u32,
@@ -45,6 +52,7 @@ struct Palette {
 const fn theme(name: &'static str, palette: Palette) -> Theme {
     Theme {
         name,
+        background: bg(palette.background),
         title: rgb(palette.accent).bold(),
         border: rgb(palette.border),
         active_border: rgb(palette.accent),
@@ -69,6 +77,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "default",
         Palette {
+            background: 0x000d_1117,
             accent: 0x0079_c0ff,
             secondary: 0x00d2_a8ff,
             tertiary: 0x007e_e787,
@@ -83,6 +92,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "solarized-dark",
         Palette {
+            background: 0x0000_2b36,
             accent: 0x0026_8bd2,
             secondary: 0x006c_71c4,
             tertiary: 0x002a_a198,
@@ -97,6 +107,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "solarized-light",
         Palette {
+            background: 0x00fd_f6e3,
             accent: 0x0026_8bd2,
             secondary: 0x006c_71c4,
             tertiary: 0x002a_a198,
@@ -111,6 +122,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "monokai",
         Palette {
+            background: 0x0027_2822,
             accent: 0x00a6_e22e,
             secondary: 0x00ae_81ff,
             tertiary: 0x0066_d9ef,
@@ -125,6 +137,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "molokai",
         Palette {
+            background: 0x001b_1d1e,
             accent: 0x00fd_971f,
             secondary: 0x00ae_81ff,
             tertiary: 0x0066_d9ef,
@@ -139,6 +152,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "dracula",
         Palette {
+            background: 0x0028_2a36,
             accent: 0x00bd_93f9,
             secondary: 0x00ff_79c6,
             tertiary: 0x008b_e9fd,
@@ -153,6 +167,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "gruvbox-dark",
         Palette {
+            background: 0x0028_2828,
             accent: 0x00fa_bd2f,
             secondary: 0x00d3_869b,
             tertiary: 0x008e_c07c,
@@ -167,6 +182,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "gruvbox-light",
         Palette {
+            background: 0x00fb_f1c7,
             accent: 0x0007_6678,
             secondary: 0x008f_3f71,
             tertiary: 0x0042_7b58,
@@ -181,6 +197,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "one-dark",
         Palette {
+            background: 0x0028_2c34,
             accent: 0x0061_afef,
             secondary: 0x00c6_78dd,
             tertiary: 0x0056_b6c2,
@@ -195,6 +212,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "one-light",
         Palette {
+            background: 0x00fa_fafa,
             accent: 0x0040_78f2,
             secondary: 0x00a6_26a4,
             tertiary: 0x0001_84bc,
@@ -209,6 +227,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "nord",
         Palette {
+            background: 0x002e_3440,
             accent: 0x0088_c0d0,
             secondary: 0x00b4_8ead,
             tertiary: 0x008f_bcbb,
@@ -223,6 +242,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "github-dark",
         Palette {
+            background: 0x000d_1117,
             accent: 0x0058_a6ff,
             secondary: 0x00bc_8cff,
             tertiary: 0x0056_d364,
@@ -237,6 +257,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "github-light",
         Palette {
+            background: 0x00ff_ffff,
             accent: 0x0009_69da,
             secondary: 0x0082_50df,
             tertiary: 0x001a_7f37,
@@ -251,6 +272,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "nord-dark",
         Palette {
+            background: 0x002e_3440,
             accent: 0x0081_a1c1,
             secondary: 0x00b4_8ead,
             tertiary: 0x008f_bcbb,
@@ -266,6 +288,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
         "catppuccin-mocha",
         Palette {
             accent: 0x00cb_a6f7,
+            background: 0x001e_1e2e,
             secondary: 0x00f5_c2e7,
             tertiary: 0x0094_e2d5,
             muted: 0x00a6_adc8,
@@ -280,6 +303,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
         "tokyo-night",
         Palette {
             accent: 0x007a_a2f7,
+            background: 0x001a_1b26,
             secondary: 0x00bb_9af7,
             tertiary: 0x007d_cfff,
             muted: 0x0089_9ac4,
@@ -294,6 +318,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
         "everforest",
         Palette {
             accent: 0x00a7_c080,
+            background: 0x002d_353b,
             secondary: 0x00d6_99b6,
             tertiary: 0x0083_c092,
             muted: 0x009d_a9a0,
@@ -308,6 +333,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
         "kanagawa",
         Palette {
             accent: 0x007e_9cd8,
+            background: 0x001f_1f28,
             secondary: 0x0095_7fb8,
             tertiary: 0x007a_a89f,
             muted: 0x009c_abca,
@@ -322,6 +348,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
         "rose-pine",
         Palette {
             accent: 0x00c4_a7e7,
+            background: 0x0019_1724,
             secondary: 0x00eb_bcba,
             tertiary: 0x009c_cfd8,
             muted: 0x0090_8caa,
@@ -335,6 +362,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "rose-pine-dawn",
         Palette {
+            background: 0x00fa_f4ed,
             accent: 0x0090_7aa9,
             secondary: 0x00b4_637a,
             tertiary: 0x0028_6983,
@@ -349,6 +377,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "ayu-dark",
         Palette {
+            background: 0x000b_0e14,
             accent: 0x00ff_b454,
             secondary: 0x00d2_a6ff,
             tertiary: 0x0095_e6cb,
@@ -363,6 +392,7 @@ pub(crate) const BUILTIN_THEMES: &[Theme] = &[
     theme(
         "catppuccin-latte",
         Palette {
+            background: 0x00ef_f1f5,
             accent: 0x0088_39ef,
             secondary: 0x00ea_76cb,
             tertiary: 0x0017_9299,

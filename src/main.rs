@@ -88,7 +88,7 @@ async fn run(cli: Cli) -> Result<()> {
         anstream::eprintln!("Warning: {warning}");
     }
     if cli.tui {
-        return tui::run(dashboard, theme, refresh).await;
+        return tui::run(dashboard, &theme, refresh).await;
     }
     if !cli.no_progress && std::io::stderr().is_terminal() && !dashboard.accounts().is_empty() {
         anstream::eprintln!(
@@ -109,7 +109,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .wrap_err("failed to serialize account usage JSON")?
         );
     } else {
-        render::render_report(&snapshots, render::report_width(cli.width), theme)
+        render::render_report(&snapshots, render::report_width(cli.width), &theme)
             .wrap_err("failed to render usage report")?;
     }
     Ok(())

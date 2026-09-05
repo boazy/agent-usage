@@ -72,7 +72,7 @@ enum Action {
 }
 
 impl DashboardView {
-    fn new(dashboard: &Dashboard, theme: Theme) -> Self {
+    fn new(dashboard: &Dashboard, theme: &Theme) -> Self {
         let snapshots = dashboard
             .accounts()
             .iter()
@@ -94,7 +94,7 @@ impl DashboardView {
             filter: String::new(),
             provider: None,
             account: None,
-            theme,
+            theme: *theme,
             color: color_enabled(),
             scroll: 0,
             mode: Mode::Browse,
@@ -133,7 +133,7 @@ impl DashboardView {
             &self.snapshots,
             &ready,
             width,
-            self.theme,
+            &self.theme,
             self.color,
             details,
             reserved,
@@ -298,6 +298,12 @@ impl DashboardView {
         choices
     }
 
+    fn apply_background(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        frame
+            .buffer_mut()
+            .set_style(area, style(self.theme.background, self.color));
+    }
+
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         if area.width == 0 || area.height == 0 {
@@ -319,9 +325,11 @@ impl DashboardView {
         );
         if content.height == 0 && !providers.is_empty() {
             self.draw_loading(frame, area, &providers);
+            self.apply_background(frame, area);
             return;
         }
         if area.height == 1 {
+            self.apply_background(frame, area);
             return;
         }
         let filters = format!(
@@ -335,11 +343,13 @@ impl DashboardView {
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         );
         if area.height < 4 {
+            self.apply_background(frame, area);
             return;
         }
         if panes.is_empty() && providers.is_empty() {
             frame.render_widget(
-                Paragraph::new("No matching accounts. Clear / filter or select All with p / a."),
+                Paragraph::new("No matching accounts. Clear / filter or select All with p / a.")
+                    .style(style(self.theme.label, self.color)),
                 content,
             );
         }
@@ -387,6 +397,7 @@ impl DashboardView {
             Rect::new(area.x, footer_y.saturating_add(1), area.width, 1),
         );
         self.draw_picker(frame, area);
+        self.apply_background(frame, area);
     }
 
     fn draw_loading(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect, providers: &[String]) {
@@ -498,6 +509,7 @@ impl DashboardView {
             .map(|choice| ListItem::new(choice.label.as_str()))
             .collect();
         let list = List::new(items)
+            .style(style(self.theme.label, self.color))
             .highlight_symbol("> ")
             .highlight_style(style(self.theme.selection, self.color));
         let mut state = ListState::default()
@@ -753,7 +765,7 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), Show, terminal::LeaveAlternateScreen);
 }
 
-pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: Theme, refresh: Duration) -> Result<()> {
+pub(crate) async fn run(dashboard: Arc<Dashboard>, theme: &Theme, refresh: Duration) -> Result<()> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         return Err(eyre!(
             "--tui requires an interactive terminal; use --report or --json for pipes"
