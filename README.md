@@ -7,7 +7,7 @@ Running `agent-usage` without arguments prints a terminal report to standard out
 ## Build and run
 
 ```sh
-cargo build --release
+cargo build --locked --release
 ./target/release/agent-usage
 ./target/release/agent-usage --report --width 140
 ./target/release/agent-usage --tui
@@ -83,6 +83,12 @@ Providers represent separate billing systems. Claude models accessed through Goo
 Codex API keys and standard Claude API keys do not expose subscription usage endpoints. OpenRouter OAuth credentials and Antigravity API keys are also unsupported. Credential discovery still imports these credentials and displays them in unavailable account panes. Unknown providers also receive dedicated unavailable panes. If quota amounts are missing or unrecognized, the tool reports them as unknown and does not estimate usage.
 
 If an account request fails, other accounts continue updating independently. Each request enforces an account timeout, caps response body sizes, and disables HTTP redirects. Concurrency limits apply across initial loading and subsequent refreshes.
+
+### TLS verification
+
+Agent Usage uses Rustls with the platform certificate verifier and preserves the system trust store. On Linux, `rustls-webpki` verifies certificate chains against system CA certificates; version 0.103.16 rejects the compromised emSign intermediate public keys described in [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382).
+
+On macOS and Windows, certificate verification uses Security.framework and the Windows certificate APIs, respectively. These platforms require current operating-system trust and revocation updates for the [eMudhra compromise](https://emudhra.we-have-a-problem.com/). Updating Agent Usage's `rustls-webpki` dependency does not replace those native trust decisions.
 
 ## Credential sources
 
