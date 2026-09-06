@@ -4,15 +4,26 @@ use crate::dashboard::{CredentialKind, Provider};
 use eyre::{eyre, Result, WrapErr};
 use fs2::FileExt as _;
 use rusqlite::{params, Connection, OpenFlags};
+#[cfg(unix)]
 use rustix::fs::{open, Mode, OFlags};
 use serde_json::{Map, Value};
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 const MAX_JSON_BYTES: u64 = 16 * 1024 * 1024;
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -78,10 +89,29 @@ struct FileIdentity {
 }
 
 impl FileIdentity {
+    #[cfg(unix)]
     fn of(metadata: &Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn of(metadata: &Metadata) -> Self {
+        Self {
+            // Stable Windows metadata exposes creation time but not the native
+            // file index; retain the strongest stable replacement signal.
+            device: 0,
+            inode: metadata.creation_time(),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of(_: &Metadata) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
         }
     }
 }
@@ -574,10 +604,10 @@ fn persist_json(origin: &mut JsonOrigin, prior: &AuthRecord, current: &AuthRecor
         .prefix(".agent-usage-auth-")
         .tempfile_in(directory)
         .wrap_err("cannot create private temporary credential file")?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .wrap_err("cannot secure temporary credential file")?;
+    set_private_permissions(
+        temporary.as_file(),
+        "cannot secure temporary credential file",
+    )?;
     temporary
         .write_all(&formatted)
         .wrap_err("cannot write temporary credential file")?;
@@ -764,55 +794,130 @@ fn secure_source_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn check_directory(directory: &Path) -> Result<()> {
+    #[cfg(unix)]
     let current_uid = rustix::process::geteuid().as_raw();
     for ancestor in directory.ancestors() {
         let metadata = fs::symlink_metadata(ancestor)
             .wrap_err("cannot inspect credential directory security")?;
-        if !metadata.is_dir() || (metadata.uid() != current_uid && metadata.uid() != 0) {
-            return Err(eyre!("credential directory must be owned by the current user or root and cannot be a symlink"));
-        }
-        let mode = metadata.permissions().mode();
-        let protected_temporary_root = mode & 0o1000 != 0;
-        if mode & 0o022 != 0 && !protected_temporary_root {
+        if !metadata.is_dir() {
             return Err(eyre!(
-                "credential directory is writable by another user; refusing insecure access"
+                "credential directory must be owned by the current user or root and cannot be a symlink"
+            ));
+        }
+        #[cfg(unix)]
+        {
+            if metadata.uid() != current_uid && metadata.uid() != 0 {
+                return Err(eyre!(
+                    "credential directory must be owned by the current user or root and cannot be a symlink"
+                ));
+            }
+            let mode = metadata.permissions().mode();
+            let protected_temporary_root = mode & 0o1000 != 0;
+            if mode & 0o022 != 0 && !protected_temporary_root {
+                return Err(eyre!(
+                    "credential directory is writable by another user; refusing insecure access"
+                ));
+            }
+        }
+        #[cfg(windows)]
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(eyre!(
+                "credential directory must be owned by the current user or root and cannot be a symlink"
             ));
         }
     }
     Ok(())
 }
 
-fn open_credential_file(path: &Path, write: bool) -> Result<File> {
-    let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
-    let descriptor = open(
-        path,
-        access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| {
-        eyre!("cannot securely open credential file (missing, inaccessible, or symlink)")
-    })?;
-    let file = File::from(descriptor);
-    check_credential_file(&file)?;
-    if write {
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .wrap_err("cannot make credential persistence private")?;
+fn set_private_permissions(file: &File, message: &'static str) -> Result<()> {
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .wrap_err(message)?;
+    #[cfg(not(unix))]
+    let _ = (file, message);
+    Ok(())
+}
+
+fn readable_by_other_users(metadata: &Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o077 != 0
     }
-    Ok(file)
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
+}
+
+fn open_credential_file(path: &Path, write: bool) -> Result<File> {
+    #[cfg(unix)]
+    {
+        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
+        let descriptor = open(
+            path,
+            access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|_| {
+            eyre!("cannot securely open credential file (missing, inaccessible, or symlink)")
+        })?;
+        let file = File::from(descriptor);
+        check_credential_file(&file)?;
+        if write {
+            set_private_permissions(&file, "cannot make credential persistence private")?;
+        }
+        return Ok(file);
+    }
+
+    #[cfg(windows)]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(write)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options.open(path).map_err(|_| {
+            eyre!("cannot securely open credential file (missing, inaccessible, or symlink)")
+        })?;
+        check_credential_file(&file)?;
+        if write {
+            set_private_permissions(&file, "cannot make credential persistence private")?;
+        }
+        return Ok(file);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, write);
+        Err(eyre!(
+            "secure credential files are unsupported on this platform"
+        ))
+    }
 }
 
 fn check_credential_file(file: &File) -> Result<()> {
     let metadata = file
         .metadata()
         .wrap_err("cannot inspect credential file security")?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-    {
+    if !metadata.is_file() {
         return Err(eyre!(
             "credential file must be a regular, singly-linked file owned by the current user"
         ));
     }
+    #[cfg(unix)]
+    if metadata.nlink() != 1 || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(eyre!(
+            "credential file must be a regular, singly-linked file owned by the current user"
+        ));
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(eyre!(
+            "credential file must be a regular, non-reparse-point file"
+        ));
+    }
+    #[cfg(unix)]
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(eyre!(
             "credential file is writable by another user; refusing insecure access"
@@ -822,14 +927,10 @@ fn check_credential_file(file: &File) -> Result<()> {
 }
 
 fn warn_readable_source(file: &File, discovery: &mut SourceDiscovery) -> Result<()> {
-    if file
+    let metadata = file
         .metadata()
-        .wrap_err("cannot inspect credential source permissions")?
-        .permissions()
-        .mode()
-        & 0o077
-        != 0
-    {
+        .wrap_err("cannot inspect credential source permissions")?;
+    if readable_by_other_users(&metadata) {
         discovery.warnings.push("Credential source is readable by other users; restrict its permissions to mode 0600. Refresh persistence writes private credentials.".to_owned());
     }
     Ok(())
@@ -854,28 +955,51 @@ fn lock_json_source(path: &Path) -> Result<File> {
     lock_name.push(name);
     lock_name.push(".agent-usage.lock");
     let lock_path = path.with_file_name(lock_name);
-    let descriptor = open(
-        &lock_path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|_| eyre!("cannot open private credential lock file"))?;
-    let file = File::from(descriptor);
-    check_credential_file(&file)?;
-    if file
-        .metadata()
-        .wrap_err("cannot inspect credential lock permissions")?
-        .permissions()
-        .mode()
-        & 0o077
-        != 0
+
+    #[cfg(unix)]
     {
-        return Err(eyre!("credential lock file must have private mode 0600"));
+        let descriptor = open(
+            &lock_path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|_| eyre!("cannot open private credential lock file"))?;
+        let file = File::from(descriptor);
+        check_credential_file(&file)?;
+        if readable_by_other_users(
+            &file
+                .metadata()
+                .wrap_err("cannot inspect credential lock permissions")?,
+        ) {
+            return Err(eyre!("credential lock file must have private mode 0600"));
+        }
+        file.try_lock_exclusive()
+            .map_err(|_| eyre!("credential source refresh is already in progress"))?;
+        return Ok(file);
     }
-    file.try_lock_exclusive()
-        .map_err(|_| eyre!("credential source refresh is already in progress"))?;
-    // Deliberately retain the sidecar: removing it permits concurrent lock inodes.
-    Ok(file)
+
+    #[cfg(windows)]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = options
+            .open(&lock_path)
+            .map_err(|_| eyre!("cannot open private credential lock file"))?;
+        check_credential_file(&file)?;
+        file.try_lock_exclusive()
+            .map_err(|_| eyre!("credential source refresh is already in progress"))?;
+        return Ok(file);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = lock_path;
+        Err(eyre!("credential locks are unsupported on this platform"))
+    }
 }
 
 fn open_database(path: &Path, writable: bool, identity: FileIdentity) -> Result<Connection> {
@@ -946,6 +1070,7 @@ mod tests {
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
     use std::time::Duration;
@@ -961,9 +1086,17 @@ mod tests {
         }
     }
 
+    fn set_test_mode(path: &Path, mode: u32) -> Result<()> {
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        #[cfg(not(unix))]
+        let _ = (path, mode);
+        Ok(())
+    }
+
     fn write_json(path: &Path, value: &Value) -> Result<()> {
         fs::write(path, serde_json::to_vec(value)?)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        set_test_mode(path, 0o600)?;
         Ok(())
     }
 
@@ -975,7 +1108,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("agent.db");
         let connection = Connection::open(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        set_test_mode(&path, 0o600)?;
         connection.execute_batch(
             "CREATE TABLE auth_credentials (
                 id INTEGER PRIMARY KEY, provider TEXT NOT NULL, credential_type TEXT NOT NULL,
@@ -1112,7 +1245,10 @@ mod tests {
             result["unrelated-top-level"],
             concurrent["unrelated-top-level"]
         );
-        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        }
         assert_eq!(entry.origin.identity_hint(), hint);
         assert!(persist_refreshed(&mut stale_origin, &prior, &refreshed).is_err());
         assert_eq!(read_json(&path)?, result);
@@ -1164,7 +1300,7 @@ mod tests {
         assert!(ensure_json_unchanged(&path, &expected, identity).is_err());
         let replacement = directory.path().join("replacement.json");
         fs::write(&replacement, &expected)?;
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        set_test_mode(&replacement, 0o600)?;
         fs::rename(&replacement, &path)?;
         assert!(ensure_json_unchanged(&path, &expected, identity).is_err());
         Ok(())
@@ -1311,6 +1447,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn insecure_files_and_symlinks_are_rejected_before_secret_reads() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -1319,21 +1456,22 @@ mod tests {
         let link = directory.path().join("link.json");
         symlink(&path, &link)?;
         assert!(discover_source(&source(&link, SourceKind::Codex)).is_err());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
+        set_test_mode(&path, 0o666)?;
         assert!(discover_source(&source(&path, SourceKind::Codex)).is_err());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        set_test_mode(&path, 0o600)?;
         let hardlink = directory.path().join("hardlink.json");
         fs::hard_link(&path, &hardlink)?;
         assert!(discover_source(&source(&hardlink, SourceKind::Codex)).is_err());
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn readable_omp_database_warns_without_mutation_and_refresh_makes_it_private() -> Result<()> {
         let (directory, connection) = database_fixture(true)?;
         insert_oauth(&connection, 1)?;
         let path = directory.path().join("agent.db");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        set_test_mode(&path, 0o644)?;
         let mut discovery = discover_source(&source(&path, SourceKind::Omp))?;
         assert!(discovery
             .warnings
@@ -1379,19 +1517,20 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn readonly_wal_discovery_keeps_permissions_and_persistence_secures_sidecars() -> Result<()> {
         let (directory, connection) = database_fixture(true)?;
         let path = directory.path().join("agent.db");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        set_test_mode(&path, 0o644)?;
         let mode: String =
             connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
         assert_eq!(mode, "wal");
         insert_oauth(&connection, 1)?;
         let wal = directory.path().join("agent.db-wal");
         let shm = directory.path().join("agent.db-shm");
-        fs::set_permissions(&wal, fs::Permissions::from_mode(0o644))?;
-        fs::set_permissions(&shm, fs::Permissions::from_mode(0o644))?;
+        set_test_mode(&wal, 0o644)?;
+        set_test_mode(&shm, 0o644)?;
         let mut discovery = discover_source(&source(&path, SourceKind::Omp))?;
         assert_eq!(discovery.credentials[0].auth.access_token, "access-1");
         assert_eq!(fs::metadata(&wal)?.permissions().mode() & 0o777, 0o644);
