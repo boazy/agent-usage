@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            use_cross: false
+            rustflags: ""
+            archive: tar.gz
+          - platform: linux-x86_64-musl
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+            rustflags: ""
+            archive: tar.gz
+          - platform: linux-arm64-musl
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+            rustflags: ""
+            archive: tar.gz
+          - platform: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+            rustflags: "-C target-feature=+crt-static"
+            archive: zip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build with cross
+        if: matrix.use_cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Build with Cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ASSET_NAME: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+        run: |
+          tar -C "target/${{ matrix.target }}/release" -czf "$ASSET_NAME" agent-usage
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ASSET_NAME: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.zip
+        run: |
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/agent-usage.exe" `
+            -DestinationPath $env:ASSET_NAME
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}
+          path: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-usage-${{ github.ref_name }}-*
+          path: release
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes
+          fi
