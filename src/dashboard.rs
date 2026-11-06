@@ -1,4 +1,4 @@
-use crate::api::fetch_account;
+use crate::api::{fetch_account, HttpError};
 use crate::auth::AuthRecord;
 use crate::config::{provider_matches, DashboardConfig, Exclusions, SourceConfig, SourceKind};
 use crate::sources::{
@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Semaphore};
+
+mod claude_cache;
 
 #[cfg(test)]
 mod tests;
@@ -303,6 +306,7 @@ pub(crate) struct Dashboard {
     permits: Semaphore,
     timeout: Duration,
     codex_base_url: String,
+    claude_cache_dir: Option<PathBuf>,
     stopping: AtomicBool,
     #[cfg(test)]
     test_endpoint: Option<String>,
@@ -418,6 +422,7 @@ impl Dashboard {
             permits: Semaphore::new(config.concurrency),
             timeout,
             codex_base_url: config.codex_base_url.clone(),
+            claude_cache_dir: claude_cache::directory(),
             stopping: AtomicBool::new(false),
             #[cfg(test)]
             test_endpoint: None,
@@ -481,14 +486,68 @@ impl Dashboard {
             }
             state
         };
+        let provider = state.credential.provider.clone();
+        let claude_cache = if provider == Provider::Claude
+            && state.credential.auth.kind == CredentialKind::OAuth
+        {
+            let Some(directory) = self.claude_cache_dir.clone() else {
+                return failed_snapshot(&self.accounts[index], "cannot locate Claude usage cache");
+            };
+            let mut account = self.accounts[index].clone();
+            enrich_account_info(&mut account, &state.credential.auth);
+            let auth = state.credential.auth.clone();
+            let cache = match tokio::task::spawn_blocking(move || {
+                let mut cache = claude_cache::Cache::open(&directory, &account)?;
+                if cache.bind_credential(&auth) {
+                    cache.save()?;
+                }
+                Ok::<_, eyre::Report>(cache)
+            })
+            .await
+            {
+                Ok(Ok(cache)) => cache,
+                Ok(Err(error)) => {
+                    return failed_snapshot(
+                        &self.accounts[index],
+                        &format!("Claude usage cache: {error}"),
+                    );
+                }
+                Err(_) => {
+                    return failed_snapshot(
+                        &self.accounts[index],
+                        "Claude usage cache worker failed",
+                    );
+                }
+            };
+            if let Some(now) = crate::time::now_millis() {
+                let mut account = self.accounts[index].clone();
+                enrich_account_info(&mut account, &state.credential.auth);
+                if let Some(snapshot) = cache.cached(&account, now) {
+                    state.snapshot = Some(snapshot.clone());
+                    return snapshot;
+                }
+            }
+            Some(cache)
+        } else {
+            None
+        };
         let Ok(_permit) = self.permits.acquire().await else {
             return failed_snapshot(&self.accounts[index], "usage fetch queue closed");
         };
         if self.stopping.load(Ordering::Acquire) {
             return failed_snapshot(&self.accounts[index], "refresh canceled during shutdown");
         }
-        let prior = state.credential.auth.clone();
+        self.fetch_snapshot(index, &mut state, claude_cache).await
+    }
+
+    async fn fetch_snapshot(
+        &self,
+        index: usize,
+        state: &mut AccountState,
+        mut claude_cache: Option<claude_cache::Cache>,
+    ) -> AccountSnapshot {
         let provider = state.credential.provider.clone();
+        let prior = state.credential.auth.clone();
         let origin = state.credential.origin.clone();
         let lease_duration = self.timeout + Duration::from_secs(10);
         let lease = if prior.kind == CredentialKind::OAuth
@@ -520,8 +579,18 @@ impl Dashboard {
             self.fetch_current(&provider, &mut state.credential.auth),
         )
         .await;
+        let (rate_limited, retry_after) = match &result {
+            Ok(Err(error)) => match error.downcast_ref::<HttpError>() {
+                Some(HttpError::RateLimited { retry_after }) => (true, *retry_after),
+                _ => (false, None),
+            },
+            _ => (false, None),
+        };
         let mut warnings = Vec::new();
         if state.credential.auth.needs_persisted_refresh(&prior) {
+            if let Some(cache) = &mut claude_cache {
+                cache.bind_credential(&state.credential.auth);
+            }
             let mut origin = state.credential.origin.clone();
             let current = state.credential.auth.clone();
             match tokio::task::spawn_blocking(move || {
@@ -547,18 +616,32 @@ impl Dashboard {
         }
         let (usage, error) = match result {
             Ok(Ok(usage)) => (Some(usage), None),
-            Ok(Err(error)) => (None, Some(error.to_string())),
+            Ok(Err(error)) => (None, Some(format!("{error:#}"))),
             Err(_) => (None, Some("usage request timed out".to_owned())),
         };
         let mut account = self.accounts[index].clone();
         enrich_account_info(&mut account, &state.credential.auth);
-        let snapshot = AccountSnapshot {
+        let mut snapshot = AccountSnapshot {
             account,
             usage,
             error,
             fetched_at: now_ms(),
             warnings,
         };
+        if let Some(mut cache) = claude_cache.take() {
+            if let Some(now) = crate::time::now_millis() {
+                snapshot = cache.record(snapshot, rate_limited, retry_after, now);
+            }
+            match tokio::task::spawn_blocking(move || cache.save()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => snapshot
+                    .warnings
+                    .push(format!("Claude usage cooldown could not be saved: {error}")),
+                Err(_) => snapshot
+                    .warnings
+                    .push("Claude usage cooldown persistence worker failed".to_owned()),
+            }
+        }
         state.snapshot = Some(snapshot.clone());
         snapshot
     }

@@ -225,7 +225,12 @@ impl FixtureServer {
                                     std::thread::sleep(Duration::from_millis(2));
                                 }
                             }
-                            let (status, body) = if request.starts_with("GET /api/auth/me ") {
+                            let claude = request.starts_with("GET /api/oauth/usage ");
+                            let (status, body) = if claude && request.contains("synthetic-rate-limited") {
+                                ("429 Too Many Requests", r#"{"error":"MUST-NOT-LEAK"}"#)
+                            } else if claude {
+                                ("200 OK", r#"{"five_hour":{"utilization":25}}"#)
+                            } else if request.starts_with("GET /api/auth/me ") {
                                 ("200 OK", r#"{"sub":"user_fixture","email":"person@example.invalid","name":"Fixture Person"}"#)
                             } else if request.starts_with("GET /api/usage-summary ") {
                                 ("200 OK", r#"{"membershipType":"pro-plus"}"#)
@@ -234,7 +239,8 @@ impl FixtureServer {
                             } else {
                                 ("200 OK", r#"{"data":{"usage":12.5,"limit":50,"limit_remaining":37.5,"is_management_key":false}}"#)
                             };
-                            let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                            let retry_after = if status.starts_with("429") { "Retry-After: 900\r\n" } else { "" };
+                            let response = format!("HTTP/1.1 {status}\r\n{retry_after}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                             let _ = socket.write_all(response.as_bytes());
                             active.fetch_sub(1, Ordering::SeqCst);
                         }));
@@ -601,5 +607,250 @@ async fn cursor_snapshot_keeps_verified_identity_and_plan_when_usage_is_partial(
     assert_eq!(remaining.account.label, unidentified_label);
     assert!(remaining.account.email.is_none());
     drop(file);
+    Ok(())
+}
+
+fn private_cache_directory() -> Result<tempfile::TempDir> {
+    let directory = tempfile::tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(directory)
+}
+
+#[tokio::test]
+async fn claude_poll_cache_survives_dashboard_reload_without_throttling_other_providers(
+) -> Result<()> {
+    let server = FixtureServer::start()?;
+    let cache_directory = private_cache_directory()?;
+    let (file, source) = fixture(
+        &json!({
+            "anthropic":{"type":"oauth","access":"synthetic-claude","accountId":"account"},
+            "openrouter":{"type":"api_key","key":"synthetic-openrouter"}
+        }),
+        SourceKind::Omp,
+        "fixture",
+    )?;
+    let config = DashboardConfig {
+        sources: vec![source],
+        ..DashboardConfig::default()
+    };
+    let mut dashboard = Dashboard::load(&config)?;
+    dashboard.test_endpoint = Some(server.endpoint.clone());
+    dashboard.claude_cache_dir = Some(cache_directory.path().to_path_buf());
+    let ids: Vec<_> = dashboard
+        .accounts
+        .iter()
+        .map(|account| account.id.clone())
+        .collect();
+    let initial = dashboard.refresh(&ids).await;
+    assert!(initial.iter().all(|snapshot| snapshot.usage.is_some()));
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    let cached = dashboard.refresh(&ids).await;
+    assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+    let initial_claude = initial
+        .iter()
+        .find(|snapshot| snapshot.account.provider == Provider::Claude)
+        .ok_or_else(|| eyre::eyre!("missing Claude snapshot"))?;
+    let cached_claude = cached
+        .iter()
+        .find(|snapshot| snapshot.account.provider == Provider::Claude)
+        .ok_or_else(|| eyre::eyre!("missing cached Claude snapshot"))?;
+    assert_eq!(cached_claude.fetched_at, initial_claude.fetched_at);
+    assert!(cached_claude
+        .warnings
+        .iter()
+        .any(|warning| warning.to_lowercase().contains("cached")));
+    let mut reloaded = Dashboard::load(&config)?;
+    reloaded.test_endpoint = Some(server.endpoint.clone());
+    reloaded.claude_cache_dir = dashboard.claude_cache_dir.clone();
+    let cached = reloaded
+        .refresh(std::slice::from_ref(&initial_claude.account.id))
+        .await;
+    assert_eq!(server.requests.load(Ordering::SeqCst), 3);
+    let snapshot = cached
+        .first()
+        .ok_or_else(|| eyre::eyre!("missing reloaded snapshot"))?;
+    assert_eq!(snapshot.fetched_at, initial_claude.fetched_at);
+    assert_eq!(
+        snapshot
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.limits.allowances.first())
+            .and_then(|allowance| allowance.credits.used_percent()),
+        Some(25.0),
+    );
+    drop(file);
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_429_keeps_last_usage_and_persists_server_cooldown() -> Result<()> {
+    let server = FixtureServer::start()?;
+    let cache_directory = private_cache_directory()?;
+    let (file, source) = fixture(
+        &json!({"anthropic":{"type":"oauth","access":"synthetic-rate-limited",
+            "refresh":"synthetic-refresh","accountId":"account"}}),
+        SourceKind::Omp,
+        "fixture",
+    )?;
+    let config = DashboardConfig {
+        sources: vec![source],
+        ..DashboardConfig::default()
+    };
+    let mut dashboard = Dashboard::load(&config)?;
+    dashboard.test_endpoint = Some(server.endpoint.clone());
+    dashboard.claude_cache_dir = Some(cache_directory.path().to_path_buf());
+    let account = dashboard
+        .accounts
+        .first()
+        .ok_or_else(|| eyre::eyre!("missing account"))?;
+    let now = crate::time::now_millis().ok_or_else(|| eyre::eyre!("clock unavailable"))?;
+    let old = crate::time::Millis::new(now.get().saturating_sub(600_000));
+    let fetched_at = Some(i64::try_from(old.get())?);
+    let mut cache = super::claude_cache::Cache::open(cache_directory.path(), account)?;
+    cache.record(
+        super::AccountSnapshot {
+            account: account.clone(),
+            usage: Some(super::AccountUsage {
+                plan: Some("last-known-plan".to_owned()),
+                ..Default::default()
+            }),
+            error: None,
+            fetched_at,
+            warnings: Vec::new(),
+        },
+        false,
+        None,
+        old,
+    );
+    cache.save()?;
+    drop(cache);
+    let id = account.id.clone();
+    let snapshots = dashboard.refresh(std::slice::from_ref(&id)).await;
+    let stale = snapshots
+        .first()
+        .ok_or_else(|| eyre::eyre!("missing stale snapshot"))?;
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(stale.fetched_at, fetched_at);
+    assert!(stale.error.is_none());
+    assert_eq!(
+        stale.usage.as_ref().and_then(|usage| usage.plan.as_deref()),
+        Some("last-known-plan")
+    );
+    assert!(stale.warnings.iter().any(|warning| warning.contains("429")));
+    assert!(!serde_json::to_string(stale)?.contains("MUST-NOT-LEAK"));
+    let mut reloaded = Dashboard::load(&config)?;
+    reloaded.test_endpoint = Some(server.endpoint.clone());
+    reloaded.claude_cache_dir = dashboard.claude_cache_dir.clone();
+    let snapshots = reloaded.refresh(std::slice::from_ref(&id)).await;
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    let cached = snapshots
+        .first()
+        .ok_or_else(|| eyre::eyre!("missing cached snapshot"))?;
+    assert_eq!(cached.fetched_at, fetched_at);
+    assert!(cached
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("429")));
+    let cache = super::claude_cache::Cache::open(cache_directory.path(), &cached.account)?;
+    // Retry-After: 900 takes precedence over the five-minute baseline.
+    assert!(cache
+        .cached(&cached.account, now.saturating_add_seconds(600))
+        .is_some());
+    assert!(cache
+        .cached(&cached.account, now.saturating_add_seconds(910))
+        .is_none());
+    drop(file);
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_first_request_429_remains_unavailable_without_repolling() -> Result<()> {
+    let server = FixtureServer::start()?;
+    let cache_directory = private_cache_directory()?;
+    let (file, source) = fixture(
+        &json!({"anthropic":{"type":"oauth","access":"synthetic-rate-limited","accountId":"account"}}),
+        SourceKind::Omp,
+        "fixture",
+    )?;
+    let config = DashboardConfig {
+        sources: vec![source],
+        ..DashboardConfig::default()
+    };
+    for _ in 0..2 {
+        let mut dashboard = Dashboard::load(&config)?;
+        dashboard.test_endpoint = Some(server.endpoint.clone());
+        dashboard.claude_cache_dir = Some(cache_directory.path().to_path_buf());
+        let ids: Vec<_> = dashboard
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        let snapshots = dashboard.refresh(&ids).await;
+        let snapshot = snapshots
+            .first()
+            .ok_or_else(|| eyre::eyre!("missing unavailable snapshot"))?;
+        assert!(snapshot.usage.is_none());
+        assert!(snapshot
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("429")));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+    drop(file);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacing_anonymous_claude_grant_discards_usage_but_keeps_slot_cooldown() -> Result<()> {
+    let server = FixtureServer::start()?;
+    let cache_directory = private_cache_directory()?;
+    let (file, source) = fixture(
+        &json!({"anthropic":{"type":"oauth","access":"synthetic-anonymous-first"}}),
+        SourceKind::Omp,
+        "fixture",
+    )?;
+    let config = DashboardConfig {
+        sources: vec![source],
+        ..DashboardConfig::default()
+    };
+    let mut dashboard = Dashboard::load(&config)?;
+    dashboard.test_endpoint = Some(server.endpoint.clone());
+    dashboard.claude_cache_dir = Some(cache_directory.path().to_path_buf());
+    let id = dashboard.accounts[0].id.clone();
+    let initial = dashboard.refresh(std::slice::from_ref(&id)).await;
+    assert!(initial[0].usage.is_some());
+    let now = crate::time::now_millis().ok_or_else(|| eyre::eyre!("clock unavailable"))?;
+    std::fs::write(
+        file.path(),
+        serde_json::to_vec(
+            &json!({"anthropic":{"type":"oauth","access":"synthetic-anonymous-replacement"}}),
+        )?,
+    )?;
+    // The same source slot deliberately has the same fallback account identity.
+    for _ in 0..2 {
+        let mut replacement = Dashboard::load(&config)?;
+        replacement.test_endpoint = Some(server.endpoint.clone());
+        replacement.claude_cache_dir = dashboard.claude_cache_dir.clone();
+        assert_eq!(replacement.accounts[0].id, id);
+        let snapshots = replacement.refresh(std::slice::from_ref(&id)).await;
+        assert!(
+            snapshots[0].usage.is_none(),
+            "replacement grant exposed previous account's usage"
+        );
+        assert!(snapshots[0].error.is_some());
+        assert!(snapshots[0].fetched_at.is_none());
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+    let cache = super::claude_cache::Cache::open(cache_directory.path(), &dashboard.accounts[0])?;
+    assert!(cache
+        .cached(&dashboard.accounts[0], now.saturating_add_seconds(240))
+        .is_some());
+    assert!(cache
+        .cached(&dashboard.accounts[0], now.saturating_add_seconds(310))
+        .is_none());
     Ok(())
 }

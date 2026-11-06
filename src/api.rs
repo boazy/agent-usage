@@ -5,11 +5,11 @@ use crate::dashboard::{
 };
 use crate::time::{now_millis, parse_timestamp_to_ms, Millis};
 use eyre::{eyre, Result};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, RETRY_AFTER, USER_AGENT};
 use reqwest::{Client, RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use url::Url;
 
 mod antigravity;
@@ -199,9 +199,9 @@ async fn fetch_with_endpoints(
             // persists a rotated refresh token even when usage is unavailable.
             fetch_once(client, provider, auth, endpoints)
                 .await
-                .map_err(|error| eyre!("usage after token refresh: {error}"))
+                .map_err(|error| eyre::Report::new(error).wrap_err("usage after token refresh"))
         }
-        result => result.map_err(|error| eyre!("usage request: {error}")),
+        result => result.map_err(|error| eyre::Report::new(error).wrap_err("usage request")),
     }
 }
 
@@ -276,7 +276,7 @@ async fn refresh(
     };
     let payload = request_json(request)
         .await
-        .map_err(|error| eyre!("OAuth refresh: {error}"))?;
+        .map_err(|error| eyre::Report::new(error).wrap_err("OAuth refresh"))?;
     let access_key = if *provider == Provider::Cursor {
         "accessToken"
     } else {
@@ -317,8 +317,9 @@ async fn refresh(
 }
 
 #[derive(Debug)]
-enum HttpError {
+pub(crate) enum HttpError {
     Status(StatusCode),
+    RateLimited { retry_after: Option<Duration> },
     Timeout,
     Transport,
     InvalidCredential,
@@ -331,6 +332,7 @@ impl fmt::Display for HttpError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Status(status) => write!(formatter, "endpoint returned HTTP {}", status.as_u16()),
+            Self::RateLimited { .. } => formatter.write_str("endpoint returned HTTP 429"),
             Self::Timeout => formatter.write_str("request timed out"),
             Self::Transport => formatter.write_str("could not contact endpoint"),
             Self::InvalidCredential => {
@@ -343,6 +345,19 @@ impl fmt::Display for HttpError {
             }
         }
     }
+}
+
+impl std::error::Error for HttpError {}
+
+fn parse_retry_after(value: Option<&HeaderValue>, now: SystemTime) -> Option<Duration> {
+    let value = value?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    date.signed_duration_since(chrono::DateTime::<chrono::Utc>::from(now))
+        .to_std()
+        .ok()
 }
 
 fn transport_error(error: &reqwest::Error) -> HttpError {
@@ -374,6 +389,14 @@ async fn request_json(request: RequestBuilder) -> std::result::Result<Value, Htt
             .send()
             .await
             .map_err(|error| transport_error(&error))?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(HttpError::RateLimited {
+                retry_after: parse_retry_after(
+                    response.headers().get(RETRY_AFTER),
+                    SystemTime::now(),
+                ),
+            });
+        }
         if !response.status().is_success() {
             return Err(HttpError::Status(response.status()));
         }

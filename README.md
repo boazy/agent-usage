@@ -84,6 +84,8 @@ Codex API keys and standard Claude API keys do not expose subscription usage end
 
 If an account request fails, other accounts continue updating independently. Each request enforces an account timeout, caps response body sizes, and disables HTTP redirects. Concurrency limits apply across initial loading and subsequent refreshes.
 
+Claude usage requests are at least five minutes apart per account, including manual refreshes and separate invocations. HTTP 429 responses increase the cooldown up to one hour, or longer when required by `Retry-After`. The tool does not retry immediately or refresh tokens to bypass a rate limit. It stores usage readings and cooldowns in a private application cache, without credentials. During a cooldown, reports and the dashboard reuse cached readings and preserve their original `fetched_at` timestamp. If a request fails, a warning identifies the last successful reading as stale; accounts without a successful reading remain unavailable.
+
 ### TLS verification
 
 Agent Usage uses Rustls with the platform certificate verifier and preserves the system trust store. On Linux, `rustls-webpki` verifies certificate chains against system CA certificates; version 0.103.16 rejects the compromised emSign intermediate public keys described in [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382).
@@ -181,11 +183,11 @@ Pickers filter search results case-insensitively as you type. The account picker
 
 An empty live filter restores the full account list. Selecting a provider or account clears the previous live filter text. Resizing the terminal or changing filters causes the dashboard to recompute pane placement and visibility.
 
-Initial usage fetching runs in the background. Each account pane appears as soon as its request finishes, and the layout repacks remaining panes as results arrive. Accounts that have not finished their initial fetch show no placeholder boxes. If an account request fails, an error pane appears for that account and provider, while other accounts from the same provider continue to display their usage.
+Initial usage fetching runs in the background. Each account pane appears as soon as its request finishes, and the layout repacks remaining panes as results arrive. Accounts that have not finished their initial fetch show no placeholder boxes.
 
 While requests remain pending, a status box in the bottom-right corner displays the list of active providers. It lists each pending provider once, even when multiple accounts are loading under that provider. A provider leaves the list only when all its accounts finish loading or fail. Filter changes do not interrupt pending background work. The layout reserves space for this status box so it never obscures account data. If the list of pending providers exceeds the available box height, scroll it with `[` and `]`.
 
-Existing usage data remains visible during background refreshes. Automatic refreshes query visible panes at the interval set by `refresh_seconds`. Off-screen panes retain their cached state until scrolled into view and refreshed.
+Existing usage data remains visible during background refreshes. Automatic refreshes check visible panes at the interval set by `refresh_seconds`, subject to Claude's polling cooldown. Off-screen panes retain their cached state until scrolled into view and refreshed.
 
 Quitting the dashboard immediately restores the terminal screen and cancels queued requests. Requests already in flight finish within the configured timeout window and write back any rotated tokens before the process exits. Pressing `r` repeatedly does not queue redundant refresh operations. The dashboard also restores the terminal if the application encounters a fatal error or panic.
 

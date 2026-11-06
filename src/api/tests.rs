@@ -1,13 +1,15 @@
-use super::{fetch_account, fetch_account_at, request_json, HttpError, MAX_RESPONSE_BYTES};
+use super::{
+    fetch_account, fetch_account_at, parse_retry_after, request_json, HttpError, MAX_RESPONSE_BYTES,
+};
 use crate::auth::AuthRecord;
 use crate::dashboard::{CredentialKind, Provider};
 use eyre::{eyre, Result};
-use reqwest::Client;
+use reqwest::{header::HeaderValue, Client};
 use serde_json::{json, Value};
 use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 pub(super) fn client() -> Result<Client> {
     Ok(Client::builder()
@@ -159,7 +161,10 @@ async fn rejected_claude_token_refreshes_once_and_rotation_survives_usage_failur
         .await
         .err()
         .ok_or_else(|| eyre!("failed account unexpectedly succeeded"))?;
-    assert!(error.to_string().contains("HTTP 401"));
+    assert!(matches!(
+        error.downcast_ref::<HttpError>(),
+        Some(HttpError::Status(status)) if *status == reqwest::StatusCode::UNAUTHORIZED
+    ));
     assert!(!format!("{error:?}").contains("synthetic"));
     assert_eq!(auth.access_token, "synthetic-rotated-access");
     assert_eq!(
@@ -189,6 +194,169 @@ async fn rejected_claude_token_refreshes_once_and_rotation_survives_usage_failur
     assert!(requests
         .last()
         .is_some_and(|request| request.contains("Bearer synthetic-rotated-access")));
+    Ok(())
+}
+
+#[test]
+fn retry_after_parses_nonnegative_seconds_and_rejects_invalid_headers() -> Result<()> {
+    let now = SystemTime::UNIX_EPOCH;
+    for (value, seconds) in [("600", 600), ("0", 0), (" 60 ", 60)] {
+        let header = HeaderValue::from_str(value)?;
+        assert_eq!(
+            parse_retry_after(Some(&header), now),
+            Some(Duration::from_secs(seconds))
+        );
+    }
+    for value in [
+        "",
+        "-1",
+        "+1",
+        "1.5",
+        "private-invalid-date",
+        "18446744073709551616",
+    ] {
+        let header = HeaderValue::from_str(value)?;
+        assert_eq!(parse_retry_after(Some(&header), now), None);
+    }
+    let non_ascii = HeaderValue::from_bytes(b"\xff")?;
+    assert_eq!(parse_retry_after(Some(&non_ascii), now), None);
+    assert_eq!(parse_retry_after(None, now), None);
+    Ok(())
+}
+
+#[test]
+fn retry_after_http_date_uses_explicit_time() -> Result<()> {
+    let now = SystemTime::from(chrono::DateTime::parse_from_rfc3339(
+        "1994-11-06T08:48:37Z",
+    )?);
+    let header = HeaderValue::from_static("Sun, 06 Nov 1994 08:49:37 GMT");
+    assert_eq!(
+        parse_retry_after(Some(&header), now),
+        Some(Duration::from_mins(1))
+    );
+    assert_eq!(
+        parse_retry_after(Some(&header), now + Duration::from_mins(1)),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        parse_retry_after(Some(&header), now + Duration::from_secs(61)),
+        None
+    );
+    Ok(())
+}
+
+fn rate_limited_response(retry_after: Option<&str>) -> String {
+    let header = retry_after.map_or_else(String::new, |value| format!("Retry-After: {value}\r\n"));
+    let body = "synthetic-private-response";
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+#[tokio::test]
+async fn claude_rate_limit_preserves_metadata_without_retrying_or_refreshing() -> Result<()> {
+    let client = client()?;
+    for (header, expected) in [
+        (Some("600"), Some(Duration::from_mins(10))),
+        (Some("0"), Some(Duration::ZERO)),
+        (Some("synthetic-invalid-header"), None),
+        (None, None),
+    ] {
+        let (base, server) = serve(vec![rate_limited_response(header)])?;
+        let mut auth = auth(CredentialKind::OAuth);
+        auth.refresh_token = Some("synthetic-refresh".to_owned());
+        let prior = auth.clone();
+        let error = fetch_account_at(&client, &Provider::Claude, &mut auth, &base)
+            .await
+            .err()
+            .ok_or_else(|| eyre!("rate-limited usage unexpectedly succeeded"))?;
+        assert!(matches!(
+            error.downcast_ref::<HttpError>(),
+            Some(HttpError::RateLimited { retry_after }) if *retry_after == expected
+        ));
+        assert!(!format!("{error:?}").contains("synthetic"));
+        assert_eq!(auth.access_token, prior.access_token);
+        assert_eq!(auth.refresh_token, prior.refresh_token);
+        assert_eq!(auth.expires_at, prior.expires_at);
+        let requests = join(server)?;
+        assert_eq!(requests.len(), 1);
+        assert!(requests
+            .first()
+            .is_some_and(|request| request.starts_with("GET /api/oauth/usage ")));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_refresh_rate_limit_preserves_metadata_without_retrying() -> Result<()> {
+    let (base, server) = serve(vec![rate_limited_response(Some("900"))])?;
+    let mut auth = auth(CredentialKind::OAuth);
+    auth.refresh_token = Some("synthetic-refresh".to_owned());
+    auth.expires_at = Some(0);
+    let prior = auth.clone();
+    let error = fetch_account_at(&client()?, &Provider::Claude, &mut auth, &base)
+        .await
+        .err()
+        .ok_or_else(|| eyre!("rate-limited refresh unexpectedly succeeded"))?;
+    assert!(matches!(
+        error.downcast_ref::<HttpError>(),
+        Some(HttpError::RateLimited { retry_after: Some(delay) })
+            if *delay == Duration::from_mins(15)
+    ));
+    assert!(!format!("{error:?}").contains("synthetic"));
+    assert_eq!(auth.access_token, prior.access_token);
+    assert_eq!(auth.refresh_token, prior.refresh_token);
+    assert_eq!(auth.expires_at, prior.expires_at);
+    let requests = join(server)?;
+    assert_eq!(requests.len(), 1);
+    assert!(requests
+        .first()
+        .is_some_and(|request| request.starts_with("POST /oauth/token ")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claude_rate_limit_after_auth_refresh_preserves_metadata_without_retrying() -> Result<()> {
+    let client = client()?;
+    for status in [401, 403] {
+        let (base, server) = serve(vec![
+            response(status, &json!({})),
+            response(
+                200,
+                &json!({"access_token":"synthetic-rotated-access","refresh_token":"synthetic-rotated-refresh"}),
+            ),
+            rate_limited_response(Some("300")),
+        ])?;
+        let mut auth = auth(CredentialKind::OAuth);
+        auth.refresh_token = Some("synthetic-refresh".to_owned());
+        let error = fetch_account_at(&client, &Provider::Claude, &mut auth, &base)
+            .await
+            .err()
+            .ok_or_else(|| eyre!("rate-limited usage unexpectedly succeeded"))?;
+        assert!(matches!(
+            error.downcast_ref::<HttpError>(),
+            Some(HttpError::RateLimited { retry_after: Some(delay) })
+                if *delay == Duration::from_mins(5)
+        ));
+        assert!(!format!("{error:?}").contains("synthetic"));
+        assert_eq!(auth.access_token, "synthetic-rotated-access");
+        assert_eq!(
+            auth.refresh_token.as_deref(),
+            Some("synthetic-rotated-refresh")
+        );
+        let requests = join(server)?;
+        assert_eq!(requests.len(), 3);
+        assert!(requests
+            .first()
+            .is_some_and(|request| request.starts_with("GET /api/oauth/usage ")));
+        assert!(requests
+            .get(1)
+            .is_some_and(|request| request.starts_with("POST /oauth/token ")));
+        assert!(requests
+            .last()
+            .is_some_and(|request| request.starts_with("GET /api/oauth/usage ")));
+    }
     Ok(())
 }
 
