@@ -4,9 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -17,7 +26,7 @@ jobs:
       matrix:
         include:
           - platform: macos-arm64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             use_cross: false
             rustflags: ""
@@ -44,6 +53,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -70,7 +81,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         env:
-          ASSET_NAME: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          ASSET_NAME: agent-usage-${{ env.RELEASE_TAG }}-${{ matrix.platform }}.tar.gz
         run: |
           tar -C "target/${{ matrix.target }}/release" -czf "$ASSET_NAME" agent-usage
 
@@ -78,7 +89,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          ASSET_NAME: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.zip
+          ASSET_NAME: agent-usage-${{ env.RELEASE_TAG }}-${{ matrix.platform }}.zip
         run: |
           Compress-Archive `
             -Path "target/${{ matrix.target }}/release/agent-usage.exe" `
@@ -87,8 +98,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}
-          path: agent-usage-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive }}
+          name: agent-usage-${{ env.RELEASE_TAG }}-${{ matrix.platform }}
+          path: agent-usage-${{ env.RELEASE_TAG }}-${{ matrix.platform }}.${{ matrix.archive }}
           if-no-files-found: error
 
   publish:
@@ -101,7 +112,7 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: agent-usage-${{ github.ref_name }}-*
+          pattern: agent-usage-${{ env.RELEASE_TAG }}-*
           path: release
           merge-multiple: true
 
@@ -109,10 +120,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" release/* \
+            gh release create "$RELEASE_TAG" release/* \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --generate-notes
